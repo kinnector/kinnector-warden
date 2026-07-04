@@ -5,8 +5,6 @@ use crate::heuristics::HeuristicsEngine;
 
 mod types;
 mod heuristics;
-mod vet;
-mod api;
 mod notifications;
 mod scanner;
 mod discovery;
@@ -97,17 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Initialize EDR Heuristics Engine
     let heuristics = Arc::new(HeuristicsEngine::new());
 
-    // 5. Start Web Vetting HTTP / UNIX API Servers
-    crate::api::start_api_servers();
-
-    // 6. Auto-discover Reverse Proxies & Start Log tail auditors
+    // 5. Auto-discover Reverse Proxies
     let proxies = crate::discovery::auto_discover_proxies();
     let mut config_dirs = Vec::new();
     for proxy in proxies {
         println!("[Warden Discovery] Discovered active reverse proxy: {}", proxy.name);
-        for log_path in proxy.access_logs {
-            crate::discovery::start_log_pipeline_auditing(log_path, proxy.name.clone());
-        }
         for conf_dir in proxy.config_dirs {
             config_dirs.push(conf_dir);
         }
