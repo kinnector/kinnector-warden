@@ -19,6 +19,9 @@ pub enum EventType {
     PtraceAttach = 13,
     SSHAuth = 14,
     TerminalCommand = 15,
+    FileOpen = 16,
+    MemoryMap = 17,
+    Dup2 = 18,
 }
 
 #[repr(u8)]
@@ -166,6 +169,31 @@ pub struct SSHAuthDetails {
 pub struct TerminalCommandDetails {
     pub tty_device: [u8; 32],
     pub command: [u8; 512],
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct FileOpenDetails {
+    pub file_path: [u8; 512],
+    pub flags: u32,  // O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=64
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryMapDetails {
+    pub address: u64,
+    pub length: u64,
+    pub prot_flags: u32,   // PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
+    pub map_flags: u32,    // MAP_PRIVATE=2, MAP_ANONYMOUS=32
+    pub fd: i32,           // -1 = anonymous mapping
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+pub struct Dup2Details {
+    pub old_fd: i32,
+    pub new_fd: i32,
+    pub old_fd_type: u8,   // 0=unknown, 1=file, 2=socket, 3=pipe
 }
 
 // Struct matching full TelemetryEvent union size in C

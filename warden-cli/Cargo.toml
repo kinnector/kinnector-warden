@@ -1,0 +1,15 @@
+[package]
+name = "warden-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "warden-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+colored = "2.0"

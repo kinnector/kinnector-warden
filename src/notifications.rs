@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
+use dashmap::DashMap;
+
+static DISPATCH_DEDUP: OnceLock<Arc<DashMap<String, i64>>> = OnceLock::new();
+const DEDUP_WINDOW_SECS: i64 = 300; // 5 minutes
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SlackConfig {
@@ -89,6 +94,17 @@ pub async fn load_notification_config() -> Option<NotificationConfig> {
 
 pub fn dispatch_alert(payload: AlertPayload) {
     tokio::spawn(async move {
+        // Dedup: skip if same (threat_type, pid) fired within 5 min
+        let dedup_key = format!("{}:{}", payload.threat_type, payload.process.pid);
+        let now = chrono::Utc::now().timestamp();
+        let dedup = DISPATCH_DEDUP.get_or_init(|| Arc::new(DashMap::new()));
+        if let Some(last) = dedup.get(&dedup_key) {
+            if now - *last < DEDUP_WINDOW_SECS {
+                return;
+            }
+        }
+        dedup.insert(dedup_key, now);
+
         let config = match load_notification_config().await {
             Some(c) => c,
             None => return,

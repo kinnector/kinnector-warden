@@ -25,6 +25,20 @@ pub fn start_scanner(root_dir: String) {
     });
 }
 
+/// Check whether `installed` falls within the vulnerability's `vuln_range`.
+/// Accepts semver range expressions (e.g. ">=1.0.0, <1.2.3") or falls back
+/// to exact string equality for non-semver version strings.
+fn is_version_affected(installed: &str, vuln_range: &str) -> bool {
+    if let (Ok(ver), Ok(req)) = (
+        semver::Version::parse(installed),
+        semver::VersionReq::parse(vuln_range),
+    ) {
+        return req.matches(&ver);
+    }
+    // Fallback: exact equality (for non-semver version strings)
+    installed == vuln_range
+}
+
 async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load OSV local cache
     let osv_path = Path::new("/etc/kinnector/osv.json");
@@ -47,7 +61,7 @@ async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(version) = info.get("version").and_then(|v| v.as_str()) {
                             // Match against vulnerability database
                             for vuln in &vulnerabilities {
-                                if vuln.ecosystem == "npm" && vuln.package == *pkg_name && vuln.vulnerable_version == version {
+                                if vuln.ecosystem == "npm" && vuln.package == *pkg_name && is_version_affected(version, &vuln.vulnerable_version) {
                                     detected.push(vuln.clone());
                                 }
                             }
@@ -61,7 +75,7 @@ async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let pkg_name = pkg_path.trim_start_matches("node_modules/");
                         if let Some(version) = info.get("version").and_then(|v| v.as_str()) {
                             for vuln in &vulnerabilities {
-                                if vuln.ecosystem == "npm" && vuln.package == pkg_name && vuln.vulnerable_version == version {
+                                if vuln.ecosystem == "npm" && vuln.package == pkg_name && is_version_affected(version, &vuln.vulnerable_version) {
                                     detected.push(vuln.clone());
                                 }
                             }
@@ -84,7 +98,7 @@ async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
                     let pkg_name = parts[0].trim().to_lowercase();
                     let version = parts[1].trim();
                     for vuln in &vulnerabilities {
-                        if vuln.ecosystem == "pip" && vuln.package.to_lowercase() == pkg_name && vuln.vulnerable_version == version {
+                        if vuln.ecosystem == "pip" && vuln.package.to_lowercase() == pkg_name && is_version_affected(version, &vuln.vulnerable_version) {
                             detected.push(vuln.clone());
                         }
                     }

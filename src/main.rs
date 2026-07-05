@@ -10,6 +10,7 @@ mod scanner;
 mod discovery;
 mod fim;
 mod ffi;
+mod allowlist;
 
 #[derive(Parser, Debug)]
 #[command(name = "wardend")]
@@ -92,8 +93,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 4. Initialize EDR Heuristics Engine
-    let heuristics = Arc::new(HeuristicsEngine::new());
+    // 3b. Load config Arc for heuristics engine
+    let config_arc = Arc::new(
+        kinnector_config::ConfigManager::load(rules_path, &public_key)
+            .unwrap_or_else(|_| kinnector_config::ConfigManager::load_defaults())
+    );
+
+    // 4. Seed inode allowlist for the web root
+    let _allowlist = crate::allowlist::seed_inode_allowlist(&args.web_root);
+
+    // 5. Initialize EDR Heuristics Engine
+    let heuristics = Arc::new(HeuristicsEngine::new(Arc::clone(&config_arc)));
 
     // 5. Auto-discover Reverse Proxies
     let proxies = crate::discovery::auto_discover_proxies();
