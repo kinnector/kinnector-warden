@@ -95,6 +95,81 @@ enum Commands {
 
     /// Print version
     Version,
+
+    /// Storage and upload directory management
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StorageAction {
+    /// List all registered storage paths
+    List,
+    /// Manually register a path
+    Add {
+        /// Path to register
+        path: String,
+        /// Role to assign (upload, session, temp, app, cache, passthrough)
+        #[arg(long, default_value = "upload")]
+        role: String,
+        /// Optional target web root
+        #[arg(long)]
+        web_root: Option<String>,
+    },
+    /// Remove a path from the registry
+    Remove {
+        /// Path to remove
+        path: String,
+    },
+    /// Trigger a manual upload scan on a file
+    Scan {
+        /// File path to scan
+        path: String,
+    },
+    /// Show discovery status and warnings
+    Status {
+        /// Optional target web root
+        #[arg(long)]
+        web_root: Option<String>,
+    },
+    /// Suppress no-storage warnings for a web root
+    AcknowledgeNone {
+        /// Target web root
+        #[arg(long)]
+        web_root: String,
+    },
+    /// Clear the acknowledgement for a web root
+    ResetAck {
+        /// Target web root
+        #[arg(long)]
+        web_root: String,
+    },
+    /// Re-run all discovery pillars immediately
+    Rescan {
+        /// Optional target web root
+        #[arg(long)]
+        web_root: Option<String>,
+    },
+    /// Disable storage and FIM checks for a web root or executable (RCE prevention remains active)
+    Disable {
+        /// Optional target web root to disable
+        #[arg(long)]
+        web_root: Option<String>,
+        /// Optional target executable to disable
+        #[arg(long)]
+        exe: Option<String>,
+    },
+    /// Re-enable storage and FIM checks for a web root or executable
+    Enable {
+        /// Optional target web root to enable
+        #[arg(long)]
+        web_root: Option<String>,
+        /// Optional target executable to enable
+        #[arg(long)]
+        exe: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -197,6 +272,7 @@ fn main() {
         Commands::Rules { action } => cmd_rules(action),
         Commands::Containers => cmd_containers(),
         Commands::TestAlert => cmd_test_alert(),
+        Commands::Storage { action } => cmd_storage(action),
     }
 }
 
@@ -663,6 +739,154 @@ fn query_daemon(
 
     serde_json::from_str(body_part)
         .map_err(|e| format!("Failed to parse JSON response: {}. Body: {}", e, body_part))
+}
+
+// ---------------------------------------------------------------------------
+// Storage Management
+// ---------------------------------------------------------------------------
+fn cmd_storage(action: StorageAction) {
+    match action {
+        StorageAction::List => {
+            println!("{}", "=== Registered Storage Paths ===".bold().cyan());
+            match query_daemon("GET", "/api/v1/storage", None) {
+                Ok(res) => {
+                    if let Some(paths) = res.get("storage_paths").and_then(|p| p.as_array()) {
+                        if paths.is_empty() {
+                            println!("  No storage paths registered.");
+                        } else {
+                            println!("{:<45} {:<20} {:<12} {:<10}", "Path", "Roles", "Confidence", "Scripts");
+                            println!("{}", "-".repeat(92));
+                            for p in paths {
+                                let path = p.get("path").and_then(|x| x.as_str()).unwrap_or("");
+                                let roles = p.get("roles").and_then(|x| x.as_array())
+                                    .map(|arr| arr.iter().flat_map(|val| val.as_str()).collect::<Vec<_>>().join(", "))
+                                    .unwrap_or_default();
+                                let confidence = p.get("confidence").and_then(|x| x.as_str()).unwrap_or("");
+                                let allow_script = p.get("allow_script_extensions").and_then(|x| x.as_bool()).unwrap_or(false);
+                                
+                                println!("{:<45} {:<20} {:<12} {:<10}", path.yellow(), roles.green(), confidence.cyan(), if allow_script { "Allowed".green() } else { "Blocked".red() });
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Failed to query storage registry: {}", e.red()),
+            }
+        }
+        StorageAction::Add { path, role, web_root } => {
+            println!("[warden-cli] Adding manual storage path: {} with role: {}", path.yellow(), role.green());
+            let body = serde_json::json!({
+                "path": path,
+                "role": role,
+                "web_root": web_root.unwrap_or_default(),
+            });
+            match query_daemon("POST", "/api/v1/storage/add", Some(&body)) {
+                Ok(_) => println!("{}", "Successfully added path to storage registry.".green()),
+                Err(e) => eprintln!("Failed to add path: {}", e.red()),
+            }
+        }
+        StorageAction::Remove { path } => {
+            println!("[warden-cli] Removing storage path: {}", path.yellow());
+            let body = serde_json::json!({
+                "path": path,
+            });
+            match query_daemon("POST", "/api/v1/storage/remove", Some(&body)) {
+                Ok(_) => println!("{}", "Successfully removed path from registry.".green()),
+                Err(e) => eprintln!("Failed to remove path: {}", e.red()),
+            }
+        }
+        StorageAction::Scan { path } => {
+            println!("[warden-cli] Triggering manual upload scan on file: {}", path.yellow());
+            let body = serde_json::json!({
+                "path": path,
+            });
+            match query_daemon("POST", "/api/v1/storage/scan", Some(&body)) {
+                Ok(res) => {
+                    let result = res.get("result").and_then(|r| r.as_str()).unwrap_or("unknown");
+                    if result == "clean" {
+                        println!("{}", "Scan result: CLEAN".green().bold());
+                    } else if result == "elf" {
+                        println!("{}", "Scan result: ELF BINARY DETECTED".red().bold());
+                    } else {
+                        println!("Scan result: SUSPICIOUS ({})", result.yellow());
+                    }
+                }
+                Err(e) => eprintln!("Failed to run manual scan: {}", e.red()),
+            }
+        }
+        StorageAction::Status { web_root } => {
+            println!("{}", "=== Storage Discovery Status ===".bold().cyan());
+            match query_daemon("GET", "/api/v1/storage", None) {
+                Ok(res) => {
+                    if let Some(paths) = res.get("storage_paths").and_then(|p| p.as_array()) {
+                        let filtered: Vec<_> = if let Some(ref wr) = web_root {
+                            paths.iter().filter(|p| p.get("path").and_then(|x| x.as_str()).unwrap_or("").starts_with(wr)).collect()
+                        } else {
+                            paths.iter().collect()
+                        };
+                        println!("Total registered storage paths: {}", filtered.len().to_string().cyan());
+                        
+                        let ack_file = std::path::Path::new("/etc/kinnector/storage_ack.json");
+                        if ack_file.exists() {
+                            if let Ok(content) = std::fs::read_to_string(ack_file) {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                                    let root_val = json.get("web_root").and_then(|r| r.as_str()).unwrap_or("");
+                                    println!("Acknowledge no-storage warning active for: {}", root_val.yellow());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Failed to fetch status: {}", e.red()),
+            }
+        }
+        StorageAction::AcknowledgeNone { web_root } => {
+            println!("[warden-cli] Acknowledging object-storage-only deployment for: {}", web_root.yellow());
+            let body = serde_json::json!({
+                "web_root": web_root,
+            });
+            match query_daemon("POST", "/api/v1/storage/acknowledge-none", Some(&body)) {
+                Ok(_) => println!("{}", "Acknowledgement successfully recorded. Warnings suppressed.".green()),
+                Err(e) => eprintln!("Failed to record acknowledgement: {}", e.red()),
+            }
+        }
+        StorageAction::ResetAck { web_root } => {
+            println!("[warden-cli] Resetting no-storage acknowledgement for: {}", web_root.yellow());
+            match query_daemon("POST", "/api/v1/storage/reset-ack", None) {
+                Ok(_) => println!("{}", "Acknowledgement reset successfully. Warnings re-enabled.".green()),
+                Err(e) => eprintln!("Failed to reset acknowledgement: {}", e.red()),
+            }
+        }
+        StorageAction::Rescan { web_root: _ } => {
+            println!("{}", "[warden-cli] Triggering manual rescan of all discovery pillars...".bold());
+            match query_daemon("POST", "/api/v1/storage/rescan", None) {
+                Ok(res) => {
+                    let count = res.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
+                    println!("{}", format!("Rescan completed successfully. Registry contains {} paths.", count).green());
+                }
+                Err(e) => eprintln!("Failed to rescan: {}", e.red()),
+            }
+        }
+        StorageAction::Disable { web_root, exe } => {
+            let body = serde_json::json!({
+                "web_root": web_root,
+                "exe": exe,
+            });
+            match query_daemon("POST", "/api/v1/storage/disable", Some(&body)) {
+                Ok(_) => println!("{}", "Successfully disabled storage and FIM checks (RCE prevention remains active).".green()),
+                Err(e) => eprintln!("Failed to disable checks: {}", e.red()),
+            }
+        }
+        StorageAction::Enable { web_root, exe } => {
+            let body = serde_json::json!({
+                "web_root": web_root,
+                "exe": exe,
+            });
+            match query_daemon("POST", "/api/v1/storage/enable", Some(&body)) {
+                Ok(_) => println!("{}", "Successfully re-enabled storage and FIM checks.".green()),
+                Err(e) => eprintln!("Failed to enable checks: {}", e.red()),
+            }
+        }
+    }
 }
 
 extern "C" {

@@ -720,7 +720,7 @@ pub fn get_listening_services() -> Vec<serde_json::Value> {
     services
 }
 
-fn detect_process_stack(pid: u32, exe_path: &str) -> String {
+pub fn detect_process_stack(pid: u32, exe_path: &str) -> String {
     let exe_lower = exe_path.to_lowercase();
     if exe_lower.contains("node") {
         return "Node.js".to_string();

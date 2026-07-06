@@ -163,6 +163,12 @@ fn process_fim_event(path: PathBuf, web_root: &str, is_deletion: bool, is_modify
         // Check if the new/modified file's inode is in the allowlist
         if let Ok(meta) = std::fs::metadata(&path) {
             if meta.is_file() {
+                let is_disabled = crate::storage_discovery::get_disabled_storage_web_roots()
+                    .iter()
+                    .any(|r| path_str.starts_with(r.key()));
+                if is_disabled {
+                    return;
+                }
                 let inode_allowed = crate::allowlist::is_inode_allowed(&path_str);
                 if inode_allowed {
                     if is_modify {

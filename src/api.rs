@@ -324,6 +324,170 @@ async fn handle_http_request(
             crate::notifications::dispatch_alert(payload);
             build_json_response(200, &json!({ "status": "dispatched", "alert_id": alert_id }))
         }
+        ("GET", "/api/v1/storage") => {
+            let registry = crate::storage_discovery::get_registry();
+            let mut list = Vec::new();
+            for entry in registry.iter() {
+                list.push(json!({
+                    "path": entry.key().to_string_lossy().to_string(),
+                    "roles": entry.value().roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                    "confidence": entry.value().confidence.as_str(),
+                    "discovered_via": entry.value().discovered_via,
+                    "web_uid": entry.value().web_uid,
+                    "allow_script_extensions": entry.value().allow_script_extensions,
+                }));
+            }
+            build_json_response(200, &json!({ "storage_paths": list }))
+        }
+        ("POST", "/api/v1/storage/add") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let path_val = json_body.get("path").and_then(|p| p.as_str());
+            let role_val = json_body.get("role").and_then(|r| r.as_str()).unwrap_or("UploadDirectory");
+            let web_root_val = json_body.get("web_root").and_then(|w| w.as_str()).unwrap_or("");
+            
+            match path_val {
+                Some(p) => {
+                    use crate::storage_discovery::{StoragePath, StorageRole, DiscoveryConfidence};
+                    let role = match role_val {
+                        "UploadDirectory" | "upload" => StorageRole::UploadDirectory,
+                        "SessionStorage" | "session" => StorageRole::SessionStorage,
+                        "TempDirectory" | "temp" => StorageRole::TempDirectory,
+                        "AppStorage" | "app" => StorageRole::AppStorage,
+                        "CompiledCache" | "cache" => StorageRole::CompiledCache,
+                        "ObjectPassthrough" | "passthrough" => StorageRole::ObjectPassthrough,
+                        _ => StorageRole::UploadDirectory,
+                    };
+                    let allow_script = matches!(role, StorageRole::CompiledCache);
+                    crate::storage_discovery::register(StoragePath {
+                        path: PathBuf::from(p),
+                        roles: vec![role],
+                        confidence: DiscoveryConfidence::High,
+                        discovered_via: vec!["manual_add".to_string()],
+                        web_uid: crate::storage_discovery::resolve_web_uid(web_root_val),
+                        allow_script_extensions: allow_script,
+                        max_file_size_hint: None,
+                    });
+                    build_json_response(200, &json!({ "status": "added", "path": p }))
+                }
+                None => build_error_response(400, "Missing path parameter"),
+            }
+        }
+        ("POST", "/api/v1/storage/remove") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let path_val = json_body.get("path").and_then(|p| p.as_str());
+            match path_val {
+                Some(p) => {
+                    let path = Path::new(p);
+                    if crate::storage_discovery::remove(path) {
+                        build_json_response(200, &json!({ "status": "removed", "path": p }))
+                    } else {
+                        build_json_response(404, &json!({ "error": "Path not found in registry" }))
+                    }
+                }
+                None => build_error_response(400, "Missing path parameter"),
+            }
+        }
+        ("POST", "/api/v1/storage/scan") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let path_val = json_body.get("path").and_then(|p| p.as_str());
+            match path_val {
+                Some(p) => {
+                    let res = crate::upload_scan::scan_uploaded_file(p).await;
+                    let status_str = match res {
+                        crate::upload_scan::ScanResult::Clean => "clean",
+                        crate::upload_scan::ScanResult::Elf => "elf",
+                        crate::upload_scan::ScanResult::Suspicious(ref r) => r,
+                    };
+                    build_json_response(200, &json!({ "status": "scanned", "result": status_str }))
+                }
+                None => build_error_response(400, "Missing path parameter"),
+            }
+        }
+        ("POST", "/api/v1/storage/acknowledge-none") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let root_val = json_body.get("web_root").and_then(|r| r.as_str());
+            match root_val {
+                Some(r) => {
+                    let ack_file = "/etc/kinnector/storage_ack.json";
+                    let ack_data = json!({
+                        "web_root": r,
+                        "acknowledged_at": chrono::Utc::now().to_rfc3339(),
+                        "reason": "object-storage-only"
+                    });
+                    if let Ok(json_str) = serde_json::to_string_pretty(&ack_data) {
+                        if std::fs::write(ack_file, json_str).is_ok() {
+                            return build_json_response(200, &json!({ "status": "acknowledged", "web_root": r }));
+                        }
+                    }
+                    build_json_response(500, &json!({ "error": "Failed to write acknowledgement file" }))
+                }
+                None => build_error_response(400, "Missing web_root parameter"),
+            }
+        }
+        ("POST", "/api/v1/storage/reset-ack") => {
+            let _ = std::fs::remove_file("/etc/kinnector/storage_ack.json");
+            build_json_response(200, &json!({ "status": "reset" }))
+        }
+        ("POST", "/api/v1/storage/rescan") => {
+            let listening_pids = crate::discovery::discover_listening_pids();
+            for root in web_roots {
+                for pid in &listening_pids {
+                    let paths = crate::storage_discovery::scan_process_env_for_storage(*pid);
+                    for p in paths { crate::storage_discovery::register(p); }
+                }
+                let paths = crate::storage_discovery::run_framework_rules(root);
+                for p in paths { crate::storage_discovery::register(p); }
+                let web_uid = crate::storage_discovery::resolve_web_uid(root);
+                let paths = crate::storage_discovery::scan_uid_writable_untracked(root, web_uid);
+                for p in paths { crate::storage_discovery::register(p); }
+                crate::storage_discovery::cross_reference_gitignore(root);
+            }
+            build_json_response(200, &json!({ "status": "rescanned", "count": crate::storage_discovery::get_registry().len() }))
+        }
+        ("POST", "/api/v1/storage/disable") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let root_val = json_body.get("web_root").and_then(|r| r.as_str());
+            let exe_val = json_body.get("exe").and_then(|e| e.as_str());
+            match (root_val, exe_val) {
+                (Some(r), _) => {
+                    crate::storage_discovery::disable_storage_for_web_root(r);
+                    build_json_response(200, &json!({ "status": "disabled", "web_root": r }))
+                }
+                (_, Some(e)) => {
+                    crate::storage_discovery::disable_storage_for_exe(e);
+                    build_json_response(200, &json!({ "status": "disabled", "exe": e }))
+                }
+                _ => build_error_response(400, "Missing web_root or exe parameter"),
+            }
+        }
+        ("POST", "/api/v1/storage/enable") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let root_val = json_body.get("web_root").and_then(|r| r.as_str());
+            let exe_val = json_body.get("exe").and_then(|e| e.as_str());
+            match (root_val, exe_val) {
+                (Some(r), _) => {
+                    crate::storage_discovery::enable_storage_for_web_root(r);
+                    build_json_response(200, &json!({ "status": "enabled", "web_root": r }))
+                }
+                (_, Some(e)) => {
+                    crate::storage_discovery::enable_storage_for_exe(e);
+                    build_json_response(200, &json!({ "status": "enabled", "exe": e }))
+                }
+                _ => build_error_response(400, "Missing web_root or exe parameter"),
+            }
+        }
         _ => build_error_response(404, "Not Found"),
     }
 }

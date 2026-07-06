@@ -19,6 +19,8 @@ mod tty_logger;
 mod tls_buffer;
 mod cloud;
 mod ssh_hardening;
+mod storage_discovery;
+mod upload_scan;
 
 #[derive(Parser, Debug)]
 #[command(name = "wardend")]
@@ -215,6 +217,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for root in &web_roots {
         crate::allowlist::start_git_commit_watcher(root.clone());
     }
+
+    // 4d. Discover and register storage directories
+    tracing::info!("[Warden Storage] Running agnostic storage discovery...");
+    let listening_pids = crate::discovery::discover_listening_pids();
+    for root in &web_roots {
+        // P1: Scan all web process environ/cmdline
+        for pid in &listening_pids {
+            let paths = crate::storage_discovery::scan_process_env_for_storage(*pid);
+            for p in paths { crate::storage_discovery::register(p); }
+        }
+        // P2: Framework config rules
+        let paths = crate::storage_discovery::run_framework_rules(root);
+        for p in paths { crate::storage_discovery::register(p); }
+        // P3: UID-writable untracked dirs
+        let web_uid = crate::storage_discovery::resolve_web_uid(root);
+        let paths = crate::storage_discovery::scan_uid_writable_untracked(root, web_uid);
+        for p in paths { crate::storage_discovery::register(p); }
+        // P4: gitignore cross-reference (confirmatory only)
+        crate::storage_discovery::cross_reference_gitignore(root);
+
+        // Zero storage path warning check
+        let mut found_any = false;
+        for entry in crate::storage_discovery::get_registry().iter() {
+            if entry.key().starts_with(root) {
+                found_any = true;
+                break;
+            }
+        }
+        if !found_any {
+            crate::storage_discovery::emit_no_storage_detected_warning(root);
+        }
+    }
+    tracing::info!("[Warden Storage] Registry contains {} storage paths.", crate::storage_discovery::get_registry().len());
 
     // 5. Initialize EDR Heuristics Engine
     let heuristics = Arc::new(HeuristicsEngine::new(

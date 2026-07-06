@@ -193,6 +193,28 @@ pub fn register_inode(file_path: &str) -> bool {
     }
 }
 
+/// Deregister a single inode from the allowlist.
+/// Called by the async upload scan pipeline if a malicious file is detected.
+pub fn deregister_inode(file_path: &str) -> bool {
+    let Some(set) = ALLOWED_INODES.get() else { return false; };
+    match std::fs::metadata(file_path) {
+        Ok(meta) => {
+            let ino = meta.ino();
+            let removed = set.remove(&ino);
+            if removed.is_some() {
+                println!(
+                    "[Warden Allowlist] Deregistered inode {} — {}",
+                    ino, file_path
+                );
+                true
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 /// Re-index all files tracked by `git ls-files --cached` in `web_root`.
 /// Returns the number of NEW inodes added (not already in the set).
 pub fn reseed_from_git(web_root: &str) -> usize {

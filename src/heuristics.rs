@@ -142,6 +142,29 @@ impl HeuristicsEngine {
 
                 // --- S-A: Web process spawned a shell interpreter ---
                 if is_parent_web {
+                    if let Some(storage) = crate::storage_discovery::is_in_storage(&std::path::Path::new(&child_exe)) {
+                        use crate::storage_discovery::StorageRole;
+                        if storage.roles.iter().any(|r| matches!(r,
+                            StorageRole::UploadDirectory | StorageRole::TempDirectory | StorageRole::SessionStorage | StorageRole::AppStorage | StorageRole::CompiledCache | StorageRole::ObjectPassthrough
+                        )) {
+                            self.terminate_threat_child(
+                                child_pid, &child_exe, &child_cmdline, &parent_exe, parent_pid,
+                                "Threat.Upload.ExecutionFromStorageDir",
+                                &format!("Process execution attempted from storage directory: {}", child_exe)
+                            );
+                            return;
+                        }
+                    }
+
+                    let in_tmp = child_exe.starts_with("/tmp/") || child_exe.starts_with("/var/tmp/") || child_exe.starts_with("/dev/shm/");
+                    if in_tmp {
+                        self.terminate_threat_child(
+                            child_pid, &child_exe, &child_cmdline, &parent_exe, parent_pid,
+                            "Threat.Upload.ExecutionFromStorageDir",
+                            &format!("Process execution attempted from system temp directory: {}", child_exe)
+                        );
+                        return;
+                    }
                     let is_shell = self.system_shells.contains(&child_exe)
                         || self.system_shells.contains(&child_lower)
                         || self.system_shells.iter().any(|s| child_exe.ends_with(s));
@@ -272,6 +295,80 @@ impl HeuristicsEngine {
                     drop(proc);
 
                     if is_web {
+                        let is_storage_disabled = crate::storage_discovery::is_storage_disabled_for_exe(&exe)
+                            || crate::storage_discovery::is_storage_disabled_for_path(&path, &self.web_roots);
+                        if is_storage_disabled {
+                            crate::allowlist::register_inode(&path);
+                            return;
+                        }
+                        // Check if it's a compiled binary server (Go, Rust, C/C++)
+                        let is_compiled = {
+                            let stack = crate::discovery::detect_process_stack(event_pid, &exe);
+                            stack == "Go (Compiled)" || stack == "Rust (Compiled)" || stack == "Native (C/C++)"
+                        };
+                        if is_compiled {
+                            let in_tmp = path.starts_with("/tmp/") || path.starts_with("/var/tmp/") || path.starts_with("/dev/shm/");
+                            let in_cwd = if let Ok(cwd) = std::fs::read_link(format!("/proc/{}/cwd", event_pid)) {
+                                std::path::Path::new(&path).starts_with(&cwd)
+                            } else {
+                                false
+                            };
+                            if in_tmp || in_cwd {
+                                crate::allowlist::register_inode(&path);
+                                return;
+                            }
+                        }
+
+                        if let Some(storage) = crate::storage_discovery::is_in_storage(std::path::Path::new(&path)) {
+                            if !storage.allow_script_extensions {
+                                let lower = path.to_lowercase();
+                                let is_script = lower.ends_with(".php") || lower.ends_with(".py") ||
+                                    lower.ends_with(".rb") || lower.ends_with(".pl") ||
+                                    lower.ends_with(".jsp") || lower.ends_with(".aspx");
+                                if is_script {
+                                    let alert_id = uuid::Uuid::new_v4().to_string();
+                                    let reason = format!(
+                                        "Web process attempted to read/interpret script in storage directory: {}",
+                                        path
+                                    );
+                                    let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason, "Threat.Upload.ScriptInterpretationBlocked");
+                                    self.emit_threat_with_id(
+                                        alert_id,
+                                        event_pid, &exe, &cmd, "", ppid,
+                                        "Threat.Upload.ScriptInterpretationBlocked",
+                                        &format!("Web process attempted to interpret script file inside storage directory: {}", path)
+                                    );
+                                    return;
+                                }
+                            }
+                            // File in storage and script check passed -> register and allow
+                            crate::allowlist::register_inode(&path);
+                            return;
+                        }
+
+                        let in_tmp = path.starts_with("/tmp/") || path.starts_with("/var/tmp/") || path.starts_with("/dev/shm/");
+                        if in_tmp {
+                            let lower = path.to_lowercase();
+                            let is_script = lower.ends_with(".php") || lower.ends_with(".py") ||
+                                lower.ends_with(".rb") || lower.ends_with(".pl") ||
+                                lower.ends_with(".jsp") || lower.ends_with(".aspx");
+                            if is_script {
+                                let alert_id = uuid::Uuid::new_v4().to_string();
+                                let reason = format!(
+                                    "Web process attempted to read/interpret script in system temp directory: {}",
+                                    path
+                                );
+                                let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason, "Threat.Upload.ScriptInterpretationBlocked");
+                                self.emit_threat_with_id(
+                                    alert_id,
+                                    event_pid, &exe, &cmd, "", ppid,
+                                    "Threat.Upload.ScriptInterpretationBlocked",
+                                    &format!("Web process attempted to interpret script file inside system temp directory: {}", path)
+                                );
+                                return;
+                            }
+                        }
+
                         if !crate::allowlist::is_inode_allowed(&path) {
                             let mode = if crate::allowlist::is_git_seeded() {
                                 "git-indexed"
@@ -494,6 +591,48 @@ impl HeuristicsEngine {
                 }
 
                 // --- Allowlist enforcement: web process writes unregistered file ---
+                if is_web {
+                    let is_storage_disabled = crate::storage_discovery::is_storage_disabled_for_exe(&exe)
+                        || crate::storage_discovery::is_storage_disabled_for_path(&path, &self.web_roots);
+                    if is_storage_disabled {
+                        crate::allowlist::register_inode(&path);
+                        return;
+                    }
+                    // Check if it's a compiled binary server (Go, Rust, C/C++)
+                    let is_compiled = {
+                        let stack = crate::discovery::detect_process_stack(event_pid, &exe);
+                        stack == "Go (Compiled)" || stack == "Rust (Compiled)" || stack == "Native (C/C++)"
+                    };
+                    if is_compiled {
+                        let is_self_modification = path == exe;
+                        if !is_self_modification {
+                            let in_tmp = path.starts_with("/tmp/") || path.starts_with("/var/tmp/") || path.starts_with("/dev/shm/");
+                            let in_cwd = if let Ok(cwd) = std::fs::read_link(format!("/proc/{}/cwd", event_pid)) {
+                                std::path::Path::new(&path).starts_with(&cwd)
+                            } else {
+                                false
+                            };
+                            if in_tmp || in_cwd {
+                                crate::allowlist::register_inode(&path);
+                                return;
+                            }
+                        }
+                    }
+
+                    let path_p = std::path::Path::new(&path);
+                    if let Some(_storage) = crate::storage_discovery::is_in_storage(path_p) {
+                        let alert_id = uuid::Uuid::new_v4().to_string();
+                        crate::storage_discovery::enqueue_upload_scan(path.clone(), alert_id);
+                        return;
+                    }
+                    let in_tmp = path.starts_with("/tmp/") || path.starts_with("/var/tmp/") || path.starts_with("/dev/shm/");
+                    if in_tmp {
+                        let alert_id = uuid::Uuid::new_v4().to_string();
+                        crate::storage_discovery::enqueue_upload_scan(path.clone(), alert_id);
+                        return;
+                    }
+                }
+
                 if is_web && !crate::allowlist::is_inode_allowed(&path) {
                     let mode = if crate::allowlist::is_git_seeded() {
                         "git-indexed"
@@ -564,7 +703,53 @@ impl HeuristicsEngine {
                 let details: FileRenameDetails = unsafe {
                     std::ptr::read(raw.details_buffer.as_ptr() as *const FileRenameDetails)
                 };
+                let src = null_terminated_str(&details.source_path);
                 let dest = null_terminated_str(&details.destination_path);
+
+                let mut exe = String::new();
+                let mut cmd = String::new();
+                let mut ppid = 0u32;
+                let mut is_web = false;
+
+                if let Some(proc) = self.process_map.get(&event_pid) {
+                    exe       = proc.exe.clone();
+                    cmd       = proc.cmdline.clone();
+                    ppid      = proc.ppid;
+                    is_web    = proc.is_web_server;
+                } else {
+                    if let Ok(link) = std::fs::read_link(format!("/proc/{}/exe", event_pid)) {
+                        exe = link.to_string_lossy().to_string();
+                    }
+                    if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{}/cmdline", event_pid)) {
+                        cmd = cmdline.replace('\0', " ");
+                    }
+                    if !exe.is_empty() && (self.config.is_web_process(&exe) || self.listening_pids.contains(&event_pid)) {
+                        is_web = true;
+                    }
+                }
+
+                if is_web {
+                    let dst_in_web_root = self.web_roots.iter().any(|r| dest.starts_with(r));
+                    if dst_in_web_root {
+                        if let Some(_storage) = crate::storage_discovery::is_in_storage(std::path::Path::new(&dest)) {
+                            let alert_id = uuid::Uuid::new_v4().to_string();
+                            crate::storage_discovery::enqueue_upload_scan(dest.clone(), alert_id);
+                        } else {
+                            let alert_id = uuid::Uuid::new_v4().to_string();
+                            let reason = format!(
+                                "Web process attempted to write/rename file outside storage: {} -> {}",
+                                src, dest
+                            );
+                            let _ = crate::quarantine::quarantine_file(&dest, &alert_id, &reason, "Threat.Upload.RenameIntoWebRoot");
+                            self.emit_threat_with_id(
+                                alert_id,
+                                event_pid, &exe, &cmd, "", ppid,
+                                "Threat.Upload.RenameIntoWebRoot",
+                                &format!("Web process attempted to rename file to a non-storage location in the web root: {} -> {}", src, dest)
+                            );
+                        }
+                    }
+                }
 
                 if self.config.is_protected_binary(&dest) {
                     if let Some(proc) = self.process_map.get(&event_pid) {
