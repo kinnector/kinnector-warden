@@ -173,11 +173,21 @@ pub async fn send_forensic_payload(alert_id: &str, payload: Vec<u8>) -> bool {
     }
 }
 
+static STARTUP_TIME: OnceLock<std::time::Instant> = OnceLock::new();
+
+fn get_uptime() -> u64 {
+    let start = STARTUP_TIME.get_or_init(std::time::Instant::now);
+    start.elapsed().as_secs()
+}
+
 fn start_log_streamer(client: &'static CloudClient) {
     let endpoint = match &client.cloud_endpoint {
         Some(ep) => ep.clone(),
         None => return,
     };
+
+    // Initialize startup time
+    let _ = STARTUP_TIME.get_or_init(std::time::Instant::now);
 
     tokio::spawn(async move {
         let http_client = reqwest::Client::new();
@@ -193,8 +203,21 @@ fn start_log_streamer(client: &'static CloudClient) {
                 continue;
             }
 
+            let is_lsm = unsafe { crate::ffi::is_lsm_active() };
+            let in_container = std::path::Path::new("/.dockerenv").exists();
+            let is_paid = crate::tls_buffer::is_paid_tier();
+            let uptime = get_uptime();
+
             let payload = serde_json::json!({
-                "logs": logs
+                "logs": logs,
+                "agent_status": {
+                    "version": "0.1.0",
+                    "status": if is_paid { "licensed" } else { "active" },
+                    "tier": if is_paid { "paid" } else { "free" },
+                    "lsm_active": is_lsm,
+                    "in_container": in_container,
+                    "uptime_secs": uptime,
+                }
             });
             let json_str = serde_json::to_string(&payload).unwrap_or_default();
 
