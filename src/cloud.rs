@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::str::FromStr;
+use std::path::Path;
 use tokio::time::sleep;
 use crate::heuristics::HeuristicsEngine;
 
@@ -84,6 +85,9 @@ pub fn start_cloud_services(heuristics: Arc<HeuristicsEngine>) {
 
     // 3. Start cloud-initiated command listener
     start_command_listener(heuristics, client);
+
+    // 4. Start forensic offline recovery uploader (every 5 minutes)
+    start_forensic_uploader(client);
 }
 
 pub async fn sync_rules_now(config: &Arc<kinnector_config::ConfigManager>) -> bool {
@@ -133,9 +137,9 @@ pub async fn sync_rules_now(config: &Arc<kinnector_config::ConfigManager>) -> bo
     }
 }
 
-pub async fn send_forensic_payload(alert_id: &str, payload: Vec<u8>) {
+pub async fn send_forensic_payload(alert_id: &str, payload: Vec<u8>) -> bool {
     let client = get_client();
-    let Some(endpoint) = &client.cloud_endpoint else { return; };
+    let Some(endpoint) = &client.cloud_endpoint else { return false; };
 
     let url = format!("{}/api/v1/forensics/{}", endpoint, alert_id);
     let http_client = reqwest::Client::new();
@@ -152,12 +156,19 @@ pub async fn send_forensic_payload(alert_id: &str, payload: Vec<u8>) {
         Ok(res) => {
             if res.status().is_success() {
                 println!("[Warden Cloud] Forensic payload for alert {} successfully uploaded to cloud.", alert_id);
+                // Mark local file as uploaded if it exists
+                let local_path = format!("/var/log/kinnector/forensic_{}.json.zst", alert_id);
+                let uploaded_path = format!("/var/log/kinnector/uploaded_forensic_{}.json.zst", alert_id);
+                let _ = std::fs::rename(local_path, uploaded_path);
+                true
             } else {
                 eprintln!("[Warden Cloud] Forensic upload returned status: {}", res.status());
+                false
             }
         }
         Err(e) => {
             eprintln!("[Warden Cloud] Forensic upload failed to connect: {}", e);
+            false
         }
     }
 }
@@ -174,8 +185,8 @@ fn start_log_streamer(client: &'static CloudClient) {
             sleep(Duration::from_secs(60)).await;
 
             let mut logs = Vec::new();
-            if let Ok(mut buf) = get_logs_buffer().lock() {
-                std::mem::swap(&mut logs, &mut buf);
+            if let Ok(buf) = get_logs_buffer().lock() {
+                logs = buf.clone();
             }
 
             if logs.is_empty() {
@@ -198,10 +209,57 @@ fn start_log_streamer(client: &'static CloudClient) {
                     if let Some(key) = &client.license_key {
                         req = req.header("X-License-Key", key);
                     }
-                    let _ = req.send().await;
+                    
+                    match req.send().await {
+                        Ok(res) if res.status().is_success() => {
+                            if let Ok(mut buf) = get_logs_buffer().lock() {
+                                let sent_len = logs.len();
+                                if buf.len() >= sent_len {
+                                    buf.drain(0..sent_len);
+                                } else {
+                                    buf.clear();
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!("[Warden Cloud] Log streaming endpoint offline or failed. Retaining log buffer for retry.");
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("[Warden Cloud] Failed to compress logs for streaming: {}", e);
+                }
+            }
+        }
+    });
+}
+
+fn start_forensic_uploader(client: &'static CloudClient) {
+    if client.cloud_endpoint.is_none() { return; }
+
+    tokio::spawn(async move {
+        loop {
+            // Check for unsent forensic payloads every 5 minutes
+            sleep(Duration::from_secs(300)).await;
+
+            let log_dir = Path::new("/var/log/kinnector");
+            let Ok(entries) = std::fs::read_dir(log_dir) else { continue; };
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                        if filename.starts_with("forensic_") && filename.ends_with(".json.zst") {
+                            let alert_id = filename
+                                .trim_start_matches("forensic_")
+                                .trim_end_matches(".json.zst");
+
+                            if let Ok(bytes) = std::fs::read(&path) {
+                                println!("[Warden Cloud] Offline recovery: Retrying forensic upload for alert {}", alert_id);
+                                let _ = send_forensic_payload(alert_id, bytes).await;
+                            }
+                        }
+                    }
                 }
             }
         }
