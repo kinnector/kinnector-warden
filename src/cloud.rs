@@ -671,7 +671,40 @@ fn resolve_incident_file(payload: &crate::notifications::AlertPayload) -> Option
         }
     }
 
-    // 3. Fallback: Parse the alert's remediation status/description for any absolute paths
+    // 3. Scan active file descriptors in /proc/<pid>/fd/ and memory maps in /proc/<pid>/maps (dynamic load check)
+    let pid = payload.process.pid;
+    if pid > 0 {
+        if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+            for entry in entries.flatten() {
+                if let Ok(link) = std::fs::read_link(entry.path()) {
+                    if link.is_file() {
+                        let ext = link.extension().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+                        if ext == "php" || ext == "js" || ext == "py" || ext == "rb" || ext == "jar" || ext == "class" {
+                            return Some(link);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(maps_str) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+            for line in maps_str.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(last_part) = parts.last() {
+                    if last_part.starts_with('/') {
+                        let p = std::path::PathBuf::from(*last_part);
+                        if p.is_file() {
+                            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+                            if ext == "php" || ext == "js" || ext == "py" || ext == "rb" || ext == "jar" || ext == "class" {
+                                return Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Fallback: Parse the alert's remediation status/description for any absolute paths
     let status = &payload.remediation.status;
     let words: Vec<&str> = status.split_whitespace().collect();
     for word in words {
