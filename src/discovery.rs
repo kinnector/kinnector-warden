@@ -269,15 +269,15 @@ fn scan_config_dir_for_roots(dir: &Path, pattern_key: &str, roots: &mut std::col
                 let trimmed = line.trim();
                 if trimmed.starts_with('#') { continue; }
 
-                if key == "DocumentRoot" && trimmed.contains("DocumentRoot") {
+                if key == "DocumentRoot" {
                     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                    if parts.len() >= 2 {
+                    if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("DocumentRoot") {
                         let path = parts[1].trim_matches('"').trim_matches('\'');
                         if path.starts_with('/') {
                             roots.insert(path.to_string());
                         }
                     }
-                } else if key == "root" && trimmed.contains("root") {
+                } else if key == "root" {
                     let clean = trimmed.trim_end_matches(';');
                     let parts: Vec<&str> = clean.split_whitespace().collect();
                     if parts.len() >= 2 {

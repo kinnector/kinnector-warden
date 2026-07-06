@@ -109,14 +109,21 @@ fn get_config() -> &'static TlsBufferConfig {
 static IS_PAID_TIER: OnceLock<bool> = OnceLock::new();
 
 pub fn is_paid_tier() -> bool {
-    *IS_PAID_TIER.get_or_init(|| {
-        let conf = std::fs::read_to_string("/etc/kinnector/core.conf").unwrap_or_default();
-        conf.lines()
-            .find(|l| l.starts_with("license_key="))
-            .map(|l| l.trim_start_matches("license_key=").trim())
-            .map(|val| !val.is_empty() && val != "free")
-            .unwrap_or(false)
-    })
+    if let Some(&val) = IS_PAID_TIER.get() {
+        return val;
+    }
+    match std::fs::read_to_string("/etc/kinnector/core.conf") {
+        Ok(conf) => {
+            *IS_PAID_TIER.get_or_init(|| {
+                conf.lines()
+                    .find(|l| l.starts_with("license_key="))
+                    .map(|l| l.trim_start_matches("license_key=").trim())
+                    .map(|val| !val.is_empty() && val != "free")
+                    .unwrap_or(false)
+            })
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn get_tls_forensics_status() -> serde_json::Value {

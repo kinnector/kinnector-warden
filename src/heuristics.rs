@@ -37,6 +37,7 @@ pub struct HeuristicsEngine {
     pub web_roots:     Vec<String>,
     pub system_shells: std::collections::HashSet<String>,
     pub listening_pids: Arc<dashmap::DashSet<u32>>,
+    pub audit_mode:    bool,
 }
 
 impl HeuristicsEngine {
@@ -50,6 +51,14 @@ impl HeuristicsEngine {
             println!("[Warden Startup] Discovered listening server PID: {}", pid);
             listening_set.insert(pid);
         }
+        let audit_mode = std::env::var("WARDEN_AUDIT")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        if audit_mode {
+            println!("[Warden Heuristics] Active Mode: AUDIT / COLLECT (No prevention containment will be executed)");
+        } else {
+            println!("[Warden Heuristics] Active Mode: PREVENTION / ENFORCEMENT");
+        }
         Self {
             process_map:    Arc::new(DashMap::new()),
             ssh_attempts:   Arc::new(DashMap::new()),
@@ -58,6 +67,7 @@ impl HeuristicsEngine {
             web_roots,
             system_shells,
             listening_pids: Arc::new(listening_set),
+            audit_mode,
         }
     }
 
@@ -1103,7 +1113,11 @@ impl HeuristicsEngine {
         desc: &str,
     ) {
         // Kill only the child pid representing the threat.
-        unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
+        if self.audit_mode {
+            println!("[Warden Heuristics AUDIT] Would SIGKILL child PID {} ({})", child_pid, child_exe);
+        } else {
+            unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
+        }
 
         let alert_id = uuid::Uuid::new_v4().to_string();
 
@@ -1209,6 +1223,13 @@ fn trigger_firewall_block(ip: &str) {
             return;
         }
     };
+    let audit_mode = std::env::var("WARDEN_AUDIT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if audit_mode {
+        println!("[Warden Heuristics AUDIT] Would block IP address: {}", ip);
+        return;
+    }
     let ip_owned = ip.to_string();
     let binary = if ip_addr.is_ipv6() { "ip6tables" } else { "iptables" };
     tokio::spawn(async move {
