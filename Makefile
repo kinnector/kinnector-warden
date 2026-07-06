@@ -7,16 +7,16 @@ CONFDIR = /etc/kinnector
 VARDIR = /var/quarantine/kinnector
 RUNDIR = /var/run/kinnector
 
-DAEMON_BIN = target/release/kinnector-warden
-CLI_BIN = target/release/warden-cli
+DAEMON_BIN = target/x86_64-unknown-linux-gnu/release/kinnector-warden
+CLI_BIN = warden-cli/target/x86_64-unknown-linux-gnu/release/warden-cli
 
 .PHONY: all build install uninstall clean
 
 all: build
 
 build:
-	cargo build --release
-	cargo build --release --manifest-path warden-cli/Cargo.toml
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static-pie" cargo build --target x86_64-unknown-linux-gnu --release
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static-pie" cargo build --target x86_64-unknown-linux-gnu --release --manifest-path warden-cli/Cargo.toml
 
 install: build
 	# Create required system directories
