@@ -42,7 +42,6 @@ static ALLOWED_INODES: OnceLock<Arc<DashSet<u64>>> = OnceLock::new();
 /// Tracks whether the allowlist was seeded from git (true) or a startup walk
 /// (false).  Walk-seeded mode is inherently less strict.
 static GIT_SEEDED: OnceLock<bool> = OnceLock::new();
-static GITIGNORE_PATTERNS: OnceLock<Vec<(String, Vec<String>)>> = OnceLock::new();
 
 static DISABLED_MONITORING_PIDS: OnceLock<Arc<DashSet<u32>>> = OnceLock::new();
 static DISABLED_TLS_PIDS: OnceLock<Arc<DashSet<u32>>> = OnceLock::new();
@@ -67,7 +66,6 @@ pub fn get_disabled_web_roots() -> Arc<DashSet<String>> {
 /// Seed the allowlist for the given web root directories.
 /// Must be called once at daemon startup before enforcement begins.
 pub fn seed_inode_allowlist(web_roots: &[String]) -> Arc<DashSet<u64>> {
-    load_gitignores(web_roots);
     let set: Arc<DashSet<u64>> = Arc::new(DashSet::new());
     let mut any_git = false;
 
@@ -134,101 +132,12 @@ pub fn load_system_shells() -> std::collections::HashSet<String> {
 // Enforcement
 // ---------------------------------------------------------------------------
 
-pub fn load_gitignores(web_roots: &[String]) {
-    let mut root_patterns = Vec::new();
-    for web_root in web_roots {
-        let gitignore_path = std::path::Path::new(web_root).join(".gitignore");
-        let mut patterns = Vec::new();
-        // Common temporary/uploads folders
-        patterns.push("storage/".to_string());
-        patterns.push("uploads/".to_string());
-        patterns.push("cache/".to_string());
-        patterns.push("tmp/".to_string());
-
-        if gitignore_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
-                for line in content.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('#') {
-                        continue;
-                    }
-                    patterns.push(trimmed.to_string());
-                }
-            }
-        }
-        root_patterns.push((web_root.clone(), patterns));
-    }
-    let _ = GITIGNORE_PATTERNS.set(root_patterns);
-}
-
-pub fn is_path_ignored(file_path: &str) -> bool {
-    let Some(root_patterns) = GITIGNORE_PATTERNS.get() else {
-        return false;
-    };
-
-    for (web_root, patterns) in root_patterns {
-        if file_path.starts_with(web_root) {
-            let rel_path = &file_path[web_root.len()..];
-            let rel_path = rel_path.trim_start_matches('/');
-            
-            for pat in patterns {
-                let pat_clean = pat.trim_start_matches('/').trim_end_matches('/');
-                if pat.ends_with('/') {
-                    if rel_path.starts_with(pat_clean) || rel_path.contains(&format!("/{}/", pat_clean)) {
-                        return true;
-                    }
-                } else {
-                    if pat.starts_with('*') {
-                        let ext = &pat[1..];
-                        if rel_path.ends_with(ext) {
-                            return true;
-                        }
-                    } else if rel_path == pat_clean || rel_path.ends_with(&format!("/{}", pat_clean)) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
+/// Returns `true` if the file is allowed (inode in the allowlist).
+/// Returns `false` if the allowlist is populated and the inode is absent.
+///
+/// Permissive when the allowlist has not been seeded yet (daemon initialisation
+/// race — should not happen in practice given startup order).
 pub fn is_inode_allowed(file_path: &str) -> bool {
-    if is_path_ignored(file_path) {
-        // Ignored path policies:
-        // A. Strictly block execution & executing binaries (mode contains executive permissions)
-        if let Ok(meta) = std::fs::metadata(file_path) {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o111 != 0 {
-                return false;
-            }
-        }
-
-        // B. Strictly block reading backend script files
-        let file_path_lower = file_path.to_lowercase();
-        let is_script = file_path_lower.ends_with(".php") ||
-                        file_path_lower.ends_with(".phtml") ||
-                        file_path_lower.ends_with(".php3") ||
-                        file_path_lower.ends_with(".php4") ||
-                        file_path_lower.ends_with(".php5") ||
-                        file_path_lower.ends_with(".phps") ||
-                        file_path_lower.ends_with(".phar") ||
-                        file_path_lower.ends_with(".sh") ||
-                        file_path_lower.ends_with(".py") ||
-                        file_path_lower.ends_with(".pl") ||
-                        file_path_lower.ends_with(".cgi") ||
-                        file_path_lower.ends_with(".jsp") ||
-                        file_path_lower.ends_with(".asp") ||
-                        file_path_lower.ends_with(".aspx");
-
-        if is_script {
-            return false;
-        }
-
-        // C. Allow static assets (images, css, pdf)
-        return true;
-    }
-
     let Some(set) = ALLOWED_INODES.get() else {
         return true; // Not seeded yet — permissive
     };
