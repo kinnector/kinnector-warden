@@ -141,6 +141,17 @@ async fn handle_http_request(
                 Err(e) => build_json_response(500, &json!({ "error": format!("Reload failed: {}", e) })),
             }
         }
+        ("POST", "/api/v1/rules/fetch") => {
+            if crate::tls_buffer::is_paid_tier() {
+                let config_clone = Arc::clone(&heuristics.config);
+                tokio::spawn(async move {
+                    let _ = crate::cloud::sync_rules_now(&config_clone).await;
+                });
+                build_json_response(200, &json!({ "status": "fetching" }))
+            } else {
+                build_json_response(402, &json!({ "error": "Remote signed rule fetch requires paid tier license." }))
+            }
+        }
         ("POST", "/api/v1/fim/add") => {
             let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
                 return build_error_response(400, "Invalid JSON");

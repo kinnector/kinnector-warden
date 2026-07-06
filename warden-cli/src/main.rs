@@ -464,7 +464,17 @@ fn cmd_rules(action: RulesAction) {
             }
         }
         RulesAction::Fetch => {
-            println!("{}", "[warden-cli] Remote signed rule fetch requires paid tier license.".yellow());
+            println!("{}", "[warden-cli] Requesting remote rule sync...".bold());
+            match query_daemon("POST", "/api/v1/rules/fetch", None) {
+                Ok(_) => println!("{}", "Remote rules fetch triggered successfully.".green()),
+                Err(e) => {
+                    if e.contains("402") {
+                        eprintln!("{}", "Error: Remote signed rule fetch requires paid tier license.".red());
+                    } else {
+                        eprintln!("Failed to fetch rules: {}", e.red());
+                    }
+                }
+            }
         }
     }
 }
