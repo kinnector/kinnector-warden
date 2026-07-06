@@ -211,6 +211,25 @@ pub fn discover_listening_pids() -> std::collections::HashSet<u32> {
         }
     }
 
+    // Add Unix domain sockets
+    if let Ok(content) = std::fs::read_to_string("/proc/net/unix") {
+        for line in content.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 7 {
+                let flags = parts[3];
+                let inode = parts[6];
+                // Flags containing 00010000 indicates a listening Unix socket (SO_ACCEPTCON)
+                if flags == "00010000" || flags.contains('1') {
+                    if let Ok(inode_val) = inode.parse::<u64>() {
+                        if inode_val > 0 {
+                            listening_inodes.insert(inode_val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
         for entry in proc_dir.flatten() {
             let name = entry.file_name();
@@ -548,6 +567,7 @@ async fn trigger_container_reconfig(id: &str, action: &str) {
 pub fn get_listening_services() -> Vec<serde_json::Value> {
     use std::collections::{HashMap, HashSet};
     let mut inode_to_port: HashMap<u64, u16> = HashMap::new();
+    let mut inode_to_unix_path: HashMap<u64, String> = HashMap::new();
 
     let files = [
         "/proc/net/tcp",
@@ -580,7 +600,26 @@ pub fn get_listening_services() -> Vec<serde_json::Value> {
         }
     }
 
+    if let Ok(content) = std::fs::read_to_string("/proc/net/unix") {
+        for line in content.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 7 {
+                let flags = parts[3];
+                let inode = parts[6];
+                let path = if parts.len() >= 8 { parts[7].to_string() } else { String::new() };
+                if flags == "00010000" || flags.contains('1') {
+                    if let Ok(inode_val) = inode.parse::<u64>() {
+                        if inode_val > 0 {
+                            inode_to_unix_path.insert(inode_val, path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut pid_to_ports: HashMap<u32, HashSet<u16>> = HashMap::new();
+    let mut pid_to_unix_paths: HashMap<u32, HashSet<String>> = HashMap::new();
 
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
         for entry in proc_dir.flatten() {
@@ -601,6 +640,11 @@ pub fn get_listening_services() -> Vec<serde_json::Value> {
                                 if let Some(&port) = inode_to_port.get(&inode_val) {
                                     pid_to_ports.entry(pid).or_default().insert(port);
                                 }
+                                if let Some(path) = inode_to_unix_path.get(&inode_val) {
+                                    if !path.is_empty() {
+                                        pid_to_unix_paths.entry(pid).or_default().insert(path.clone());
+                                    }
+                                }
                             }
                         }
                     }
@@ -610,7 +654,11 @@ pub fn get_listening_services() -> Vec<serde_json::Value> {
     }
 
     let mut services = Vec::new();
-    for (pid, ports) in pid_to_ports {
+    let mut all_pids: HashSet<u32> = HashSet::new();
+    all_pids.extend(pid_to_ports.keys());
+    all_pids.extend(pid_to_unix_paths.keys());
+
+    for pid in all_pids {
         let exe_path = format!("/proc/{}/exe", pid);
         let cwd_path = format!("/proc/{}/cwd", pid);
 
@@ -627,6 +675,8 @@ pub fn get_listening_services() -> Vec<serde_json::Value> {
         }
 
         let stack = detect_process_stack(pid, &exe);
+        let ports = pid_to_ports.get(&pid).cloned().unwrap_or_default();
+        let unix_paths = pid_to_unix_paths.get(&pid).cloned().unwrap_or_default();
 
         services.push(serde_json::json!({
             "pid": pid,
@@ -634,6 +684,7 @@ pub fn get_listening_services() -> Vec<serde_json::Value> {
             "cwd": cwd,
             "stack": stack,
             "ports": ports.into_iter().collect::<Vec<_>>(),
+            "unix_sockets": unix_paths.into_iter().collect::<Vec<_>>(),
         }));
     }
 
