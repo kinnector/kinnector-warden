@@ -25,6 +25,7 @@ pub struct ProcessNode {
     pub is_top_level_install: bool,
     pub install_root_pid: u32,
     pub depth: u32,
+    pub loaded_scripts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 pub struct HeuristicsEngine {
@@ -138,6 +139,7 @@ impl HeuristicsEngine {
                     is_top_level_install,
                     install_root_pid: final_install_root,
                     depth,
+                    loaded_scripts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 });
 
                 // --- S-A: Web process spawned a shell interpreter ---
@@ -295,6 +297,19 @@ impl HeuristicsEngine {
                     let exe = proc.exe.clone();
                     let cmd = proc.cmdline.clone();
                     let ppid = proc.ppid;
+                    if is_web {
+                        let ext = std::path::Path::new(&path).extension().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+                        if ext == "php" || ext == "js" || ext == "py" || ext == "rb" || ext == "jar" || ext == "class" {
+                            if let Ok(mut list) = proc.loaded_scripts.lock() {
+                                if !list.contains(&path) {
+                                    if list.len() >= 10 {
+                                        list.remove(0);
+                                    }
+                                    list.push(path.clone());
+                                }
+                            }
+                        }
+                    }
                     drop(proc);
 
                     if is_web {
@@ -1015,6 +1030,17 @@ impl HeuristicsEngine {
 
             _ => {}
         }
+    }
+
+    pub fn get_loaded_scripts_for_pid(&self, pid: u32) -> Option<Vec<String>> {
+        self.process_map.get(&pid).and_then(|p| {
+            if let Ok(list) = p.loaded_scripts.lock() {
+                if !list.is_empty() {
+                    return Some(list.clone());
+                }
+            }
+            None
+        })
     }
 
     /// Emit a structured threat alert for a process event.

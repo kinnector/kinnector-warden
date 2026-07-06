@@ -288,6 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         is_top_level_install: false,
                         install_root_pid: 0,
                         depth: 0,
+                        loaded_scripts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                     });
                     tracing::info!("[Warden Startup] Pre-seeded process map: PID {} ({})", pid, exe);
                 }

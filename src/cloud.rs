@@ -8,6 +8,7 @@ use crate::heuristics::HeuristicsEngine;
 static CLOUD_CLIENT: OnceLock<CloudClient> = OnceLock::new();
 static LOGS_BUFFER: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static HEURISTICS_ENGINE: OnceLock<Arc<HeuristicsEngine>> = OnceLock::new();
 
 pub fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
@@ -83,6 +84,7 @@ pub fn queue_log_entry(entry: &str) {
 }
 
 pub fn start_cloud_services(heuristics: Arc<HeuristicsEngine>) {
+    let _ = HEURISTICS_ENGINE.set(Arc::clone(&heuristics));
     let client = get_client();
     let config = Arc::clone(&heuristics.config);
 
@@ -638,6 +640,32 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
 }
 
 fn resolve_incident_file(payload: &crate::notifications::AlertPayload) -> Option<std::path::PathBuf> {
+    // 0. Check the real-time telemetry-recorded loaded scripts list for the PID or parent PID
+    let pid = payload.process.pid;
+    if pid > 0 {
+        if let Some(engine) = HEURISTICS_ENGINE.get() {
+            if let Some(scripts) = engine.get_loaded_scripts_for_pid(pid) {
+                for script in scripts {
+                    let p = std::path::PathBuf::from(script);
+                    if p.exists() && p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+            let ppid = payload.process.parent_pid;
+            if ppid > 0 {
+                if let Some(scripts) = engine.get_loaded_scripts_for_pid(ppid) {
+                    for script in scripts {
+                        let p = std::path::PathBuf::from(script);
+                        if p.exists() && p.is_file() {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 1. If it's a binary execution threat, the executed binary itself is the target
     let exec_path = std::path::PathBuf::from(&payload.process.exec_path);
     
