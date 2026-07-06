@@ -87,6 +87,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|l| l.trim_start_matches("scan_interval_hours=").trim().parse().ok())
         .unwrap_or(12);
 
+    let osv_db_path = core_conf.lines()
+        .find(|l| l.starts_with("osv_db_path="))
+        .map(|l| l.trim_start_matches("osv_db_path=").trim().to_string())
+        .unwrap_or_else(|| "/etc/kinnector/osv.json".to_string());
+    crate::scanner::init_osv_db_path(osv_db_path);
+
+
     // Write PID file
     if let Some(parent) = std::path::Path::new(&pid_file_path).parent() {
         let _ = std::fs::create_dir_all(parent);

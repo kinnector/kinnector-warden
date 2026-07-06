@@ -54,10 +54,25 @@ fn is_version_affected(installed: &str, vuln_range: &str) -> bool {
     installed == vuln_range
 }
 
+static OSV_DB_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn init_osv_db_path(path: String) {
+    let _ = OSV_DB_PATH.set(path);
+}
+
+pub fn get_osv_db_path() -> &'static str {
+    OSV_DB_PATH.get().map(|s| s.as_str()).unwrap_or("/etc/kinnector/osv.json")
+}
+
 pub(crate) async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load OSV local cache
-    let osv_path = Path::new("/etc/kinnector/osv.json");
+    let osv_path_str = get_osv_db_path();
+    let osv_path = Path::new(osv_path_str);
     if !osv_path.exists() {
+        eprintln!(
+            "[Warden Scanner] Warning: OSV database not found at '{}'. Dependency vulnerability scans will be skipped.",
+            osv_path_str
+        );
         return Ok(());
     }
 
