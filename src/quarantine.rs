@@ -20,7 +20,12 @@ pub fn get_quarantine_dir() -> &'static str {
 /// Returns `Ok(quarantine_path)` on success, `Err(e)` if the move failed.
 /// In either case, a `.quarantined` shadow placeholder is created at the
 /// original path and an alert is dispatched.
-pub fn quarantine_file(source_path: &str, alert_id: &str, reason: &str) -> std::io::Result<PathBuf> {
+pub fn quarantine_file(
+    source_path: &str,
+    alert_id: &str,
+    reason: &str,
+    threat_type: &str,
+) -> std::io::Result<PathBuf> {
     let qdir = get_quarantine_dir();
     let _ = std::fs::create_dir_all(qdir);
 
@@ -68,6 +73,7 @@ pub fn quarantine_file(source_path: &str, alert_id: &str, reason: &str) -> std::
         inode,
         reason,
         move_result.is_ok(),
+        threat_type,
     );
 
     move_result.map(|_| dest_path)
@@ -169,6 +175,7 @@ fn emit_quarantine_alert(
     inode: u64,
     reason: &str,
     success: bool,
+    threat_type: &str,
 ) {
     let status = if success {
         format!(
@@ -185,7 +192,7 @@ fn emit_quarantine_alert(
     let payload = crate::notifications::AlertPayload {
         alert_id: alert_id.to_string(),
         timestamp: Utc::now().to_rfc3339(),
-        threat_type: "Threat.Server.FileQuarantined".to_string(),
+        threat_type: threat_type.to_string(),
         severity: "CRITICAL".to_string(),
         container: None,
         process: crate::notifications::ProcessInfo {

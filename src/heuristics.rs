@@ -281,7 +281,7 @@ impl HeuristicsEngine {
                             );
                             
                             // Quarantine the file (Heuristic S-B Containment Action)
-                            let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason);
+                            let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason, "Threat.Server.ProjectFileTampered");
 
                             self.emit_threat_with_id(
                                 alert_id,
@@ -503,7 +503,7 @@ impl HeuristicsEngine {
                     );
 
                     // Quarantine the file (Heuristic S-B / S-H Containment Action)
-                    let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason);
+                    let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason, "Threat.Server.ProjectFileTampered");
 
                     self.emit_threat_with_id(
                         alert_id,

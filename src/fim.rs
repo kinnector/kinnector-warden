@@ -195,7 +195,7 @@ fn process_fim_event(path: PathBuf, web_root: &str, is_deletion: bool, is_modify
                     );
                     // P3-4: Quarantine the file immediately rather than just alerting
                     let _ = crate::quarantine::quarantine_file(
-                        &path_str, &alert_id, &reason
+                        &path_str, &alert_id, &reason, "Threat.Server.ProjectFileTampered"
                     );
                 }
             }

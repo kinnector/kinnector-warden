@@ -355,7 +355,8 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: Arc<Heuristic
                 let _ = crate::quarantine::quarantine_file(
                     path,
                     &alert_id,
-                    "Remote-initiated quarantine command from fleet manager"
+                    "Remote-initiated quarantine command from fleet manager",
+                    "Threat.Server.FileQuarantined"
                 );
             }
         }
