@@ -108,7 +108,7 @@ pub async fn sync_rules_now(config: &Arc<kinnector_config::ConfigManager>) -> bo
     let http_client = reqwest::Client::new();
     let req = http_client.get(&client_info.updates_server)
         .header("X-License-Key", license)
-        .header("X-Agent-Version", "0.1.0");
+        .header("X-Agent-Version", env!("CARGO_PKG_VERSION"));
 
     match req.send().await {
         Ok(res) => {
@@ -218,7 +218,7 @@ fn start_log_streamer(client: &'static CloudClient) {
             let payload = serde_json::json!({
                 "logs": logs,
                 "agent_status": {
-                    "version": "0.1.0",
+                    "version": env!("CARGO_PKG_VERSION"),
                     "status": if is_paid { "licensed" } else { "active" },
                     "tier": if is_paid { "paid" } else { "free" },
                     "lsm_active": is_lsm,

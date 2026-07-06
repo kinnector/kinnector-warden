@@ -135,7 +135,7 @@ async fn handle_http_request(
             let state_json = json!({
                 "status": if is_paid { "licensed" } else { "active" },
                 "tier": if is_paid { "paid" } else { "free" },
-                "version": "0.1.0",
+                "version": env!("CARGO_PKG_VERSION"),
                 "lsm_active": is_lsm,
                 "in_container": in_container,
                 "uptime_secs": uptime,
