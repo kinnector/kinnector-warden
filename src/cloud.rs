@@ -241,7 +241,7 @@ fn start_command_listener(heuristics: Arc<HeuristicsEngine>, client: &'static Cl
     });
 }
 
-async fn process_cloud_command(cmd: serde_json::Value, _heuristics: &HeuristicsEngine) {
+async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEngine) {
     let Some(action) = cmd.get("action").and_then(|a| a.as_str()) else { return; };
     println!("[Warden Cloud] Received remote control command: {}", action);
     match action {
@@ -271,6 +271,38 @@ async fn process_cloud_command(cmd: serde_json::Value, _heuristics: &HeuristicsE
                             .output().await;
                     });
                 }
+            }
+        }
+        "unblock_ip" => {
+            if let Some(ip) = cmd.get("ip").and_then(|i| i.as_str()) {
+                println!("[Warden Cloud] Remote command: Unblocking IP {}", ip);
+                if std::net::IpAddr::from_str(ip).is_ok() {
+                    let ip_owned = ip.to_string();
+                    tokio::spawn(async move {
+                        let _ = tokio::process::Command::new("iptables")
+                            .args(["-D", "INPUT", "-s", &ip_owned, "-j", "DROP"])
+                            .output().await;
+                    });
+                }
+            }
+        }
+        "trigger_scan" => {
+            println!("[Warden Cloud] Remote command: Triggering OSV vulnerability scan");
+            let roots = heuristics.web_roots.clone();
+            tokio::spawn(async move {
+                for root in roots {
+                    let _ = crate::scanner::run_scan(&root).await;
+                }
+            });
+        }
+        "reload_rules" => {
+            println!("[Warden Cloud] Remote command: Reloading local rule database");
+            let _ = heuristics.config.reload();
+        }
+        "fim_add" => {
+            if let Some(path) = cmd.get("path").and_then(|p| p.as_str()) {
+                println!("[Warden Cloud] Remote command: Adding FIM watch path {}", path);
+                let _ = crate::fim::add_fim_watch_path(std::path::PathBuf::from(path));
             }
         }
         _ => {
