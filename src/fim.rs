@@ -9,11 +9,26 @@
 use notify::{Watcher, RecursiveMode, EventKind};
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
+use std::sync::OnceLock;
+
+static FIM_ADD_TX: OnceLock<tokio::sync::mpsc::Sender<PathBuf>> = OnceLock::new();
+
+/// Request FIM to watch a new path dynamically.
+pub fn add_fim_watch_path(path: PathBuf) -> bool {
+    if let Some(tx) = FIM_ADD_TX.get() {
+        tx.try_send(path).is_ok()
+    } else {
+        false
+    }
+}
 
 pub fn start_fim_watcher(web_root: String, config_dirs: Vec<PathBuf>) {
     tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let (add_tx, mut add_rx) = tokio::sync::mpsc::channel::<PathBuf>(10);
+        let _ = FIM_ADD_TX.set(add_tx);
 
+        // Mutex/Cell wrapper not needed since notify RecommendedWatcher has internal mutability
         let mut watcher = match notify::recommended_watcher(move |res| {
             if let Ok(event) = res {
                 let _ = tx.blocking_send(event);
@@ -41,14 +56,31 @@ pub fn start_fim_watcher(web_root: String, config_dirs: Vec<PathBuf>) {
             }
         }
 
-        while let Some(event) = rx.recv().await {
-            match event.kind {
-                EventKind::Modify(_) | EventKind::Create(_) => {
-                    for path in event.paths {
-                        process_fim_event(path, &web_root);
+        loop {
+            tokio::select! {
+                Some(event) = rx.recv() => {
+                    let is_modify = matches!(event.kind, EventKind::Modify(_));
+                    match event.kind {
+                        EventKind::Modify(_) | EventKind::Create(_) => {
+                            for path in event.paths {
+                                process_fim_event(path, &web_root, false, is_modify);
+                            }
+                        }
+                        EventKind::Remove(_) => {
+                            for path in event.paths {
+                                process_fim_event(path, &web_root, true, false);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
+                Some(new_path) = add_rx.recv() => {
+                    if new_path.exists() {
+                        let _ = watcher.watch(&new_path, RecursiveMode::Recursive);
+                        println!("[Warden FIM] Watching dynamically added path: {}", new_path.display());
+                    }
+                }
+                else => break,
             }
         }
 
@@ -56,49 +88,87 @@ pub fn start_fim_watcher(web_root: String, config_dirs: Vec<PathBuf>) {
     });
 }
 
-fn process_fim_event(path: PathBuf, web_root: &str) {
+fn process_fim_event(path: PathBuf, web_root: &str, is_deletion: bool, is_modify: bool) {
     let path_str = path.to_string_lossy();
 
     if path_str.starts_with(web_root) {
+        if is_deletion {
+            // File deleted inside web root (S-H: deletion case)
+            let alert_id = uuid::Uuid::new_v4().to_string();
+            let payload = crate::notifications::AlertPayload {
+                alert_id,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                threat_type: "Threat.Server.WebRootFileDeletion".to_string(),
+                severity: "HIGH".to_string(),
+                container: None,
+                process: crate::notifications::ProcessInfo {
+                    pid: 0,
+                    exec_path: "fim-watcher".to_string(),
+                    cmdline: String::new(),
+                    parent_exec_path: "wardend".to_string(),
+                    parent_pid: std::process::id(),
+                },
+                remediation: crate::notifications::RemediationInfo {
+                    action: "LOG_ALERT".to_string(),
+                    status: format!("File deleted from web root: {}", path.display()),
+                },
+            };
+            if let Ok(s) = serde_json::to_string(&payload) {
+                let _ = crate::audit::write_to_audit_log(&s);
+            }
+            crate::notifications::dispatch_alert(payload);
+            return;
+        }
+
         // Check if the new/modified file's inode is in the allowlist
-        // If the allowlist is populated and this inode is absent, it's an
-        // unregistered file — alert immediately (no extension/path guessing)
         if let Ok(meta) = std::fs::metadata(&path) {
             if meta.is_file() {
                 let inode_allowed = crate::allowlist::is_inode_allowed(&path_str);
-                if !inode_allowed {
-                    let alert_id = format!("fim-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                    let payload = crate::notifications::AlertPayload {
-                        alert_id,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        threat_type: "Threat.Server.UnregisteredFileCreated".to_string(),
-                        severity: "CRITICAL".to_string(),
-                        container: None,
-                        process: crate::notifications::ProcessInfo {
-                            pid: 0,
-                            exec_path: "fim-watcher".to_string(),
-                            cmdline: String::new(),
-                            parent_exec_path: "wardend".to_string(),
-                            parent_pid: std::process::id(),
-                        },
-                        remediation: crate::notifications::RemediationInfo {
-                            action: "LOG_ALERT".to_string(),
-                            status: format!(
-                                "Unregistered file created in web root (inode {} not in allowlist): {}",
-                                meta.ino(), path.display()
-                            ),
-                        },
-                    };
-                    if let Ok(s) = serde_json::to_string(&payload) {
-                        let _ = write_to_audit_log(&s);
+                if inode_allowed {
+                    if is_modify {
+                        // P4-4: Modify events on allowlisted inodes are audit-only (no quarantine)
+                        let alert_id = uuid::Uuid::new_v4().to_string();
+                        let payload = crate::notifications::AlertPayload {
+                            alert_id,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            threat_type: "Event.WebRoot.FileModified".to_string(),
+                            severity: "INFO".to_string(),
+                            container: None,
+                            process: crate::notifications::ProcessInfo {
+                                pid: 0,
+                                exec_path: "fim-watcher".to_string(),
+                                cmdline: String::new(),
+                                parent_exec_path: "wardend".to_string(),
+                                parent_pid: std::process::id(),
+                            },
+                            remediation: crate::notifications::RemediationInfo {
+                                action: "AUDIT_ONLY".to_string(),
+                                status: format!("Allowlisted file modified in web root: {}", path.display()),
+                            },
+                        };
+                        if let Ok(s) = serde_json::to_string(&payload) {
+                            let _ = crate::audit::write_to_audit_log(&s);
+                        }
+                        crate::notifications::dispatch_alert(payload);
                     }
-                    crate::notifications::dispatch_alert(payload);
+                } else {
+                    let alert_id = uuid::Uuid::new_v4().to_string();
+                    let reason = format!(
+                        "Unregistered file {} in web root (inode {} not in {} allowlist)",
+                        if is_modify { "modified" } else { "created" },
+                        meta.ino(),
+                        if crate::allowlist::is_git_seeded() { "git-indexed" } else { "startup-walk" }
+                    );
+                    // P3-4: Quarantine the file immediately rather than just alerting
+                    let _ = crate::quarantine::quarantine_file(
+                        &path_str, &alert_id, &reason
+                    );
                 }
             }
         }
     } else {
         // Config directory change (S-C)
-        let alert_id = format!("fim-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        let alert_id = uuid::Uuid::new_v4().to_string();
         let payload = crate::notifications::AlertPayload {
             alert_id,
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -118,18 +188,10 @@ fn process_fim_event(path: PathBuf, web_root: &str) {
             },
         };
         if let Ok(s) = serde_json::to_string(&payload) {
-            let _ = write_to_audit_log(&s);
+            let _ = crate::audit::write_to_audit_log(&s);
         }
         crate::notifications::dispatch_alert(payload);
     }
 }
 
-fn write_to_audit_log(line: &str) -> std::io::Result<()> {
-    let _ = std::fs::create_dir_all("/var/log/kinnector");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/var/log/kinnector/audit.log")?;
-    use std::io::Write;
-    writeln!(file, "{}", line)
-}
+// Audit log helper removed — use crate::audit::write_to_audit_log instead (Q-01 fix).

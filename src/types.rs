@@ -22,6 +22,7 @@ pub enum EventType {
     FileOpen = 16,
     MemoryMap = 17,
     Dup2 = 18,
+    Listen = 19,
 }
 
 #[repr(u8)]

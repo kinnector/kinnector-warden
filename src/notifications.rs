@@ -6,6 +6,10 @@ use dashmap::DashMap;
 static DISPATCH_DEDUP: OnceLock<Arc<DashMap<String, i64>>> = OnceLock::new();
 const DEDUP_WINDOW_SECS: i64 = 300; // 5 minutes
 
+/// B-09 fix: Emit a one-time warning if notifications.json is absent so operators
+/// are not silently left wondering why webhooks aren't firing.
+static NOTIF_CONFIG_WARNED: OnceLock<()> = OnceLock::new();
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SlackConfig {
     pub enabled: bool,
@@ -107,7 +111,16 @@ pub fn dispatch_alert(payload: AlertPayload) {
 
         let config = match load_notification_config().await {
             Some(c) => c,
-            None => return,
+            None => {
+                // B-09 fix: warn once instead of silently returning
+                NOTIF_CONFIG_WARNED.get_or_init(|| {
+                    eprintln!(
+                        "[Warden Notifications] WARNING: /etc/kinnector/notifications.json not found. \
+                         Webhook dispatch is disabled. Create the file to enable Slack/Discord/Telegram alerts."
+                    );
+                });
+                return;
+            }
         };
         let client = reqwest::Client::new();
 

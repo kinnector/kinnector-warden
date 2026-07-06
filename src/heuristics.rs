@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use dashmap::DashMap;
 use chrono::Utc;
+use std::net::IpAddr;
+use std::str::FromStr;
 use crate::types::{
     TelemetryEventRaw, EventType, ProcessCreateDetails, NetworkConnectDetails,
     SSHAuthDetails, TerminalCommandDetails, FileOpenDetails, MemoryMapDetails, Dup2Details,
@@ -20,6 +22,8 @@ pub struct ProcessNode {
     pub cmdline: String,
     pub is_web_server: bool,
     pub is_install_context: bool,
+    pub is_top_level_install: bool,
+    pub install_root_pid: u32,
     pub depth: u32,
 }
 
@@ -27,14 +31,32 @@ pub struct HeuristicsEngine {
     pub process_map:   Arc<DashMap<u32, ProcessNode>>,
     pub ssh_attempts:  Arc<DashMap<String, Vec<i64>>>,
     pub config:        Arc<kinnector_config::ConfigManager>,
+    /// Tracks last-seen timestamp (Unix secs) per PID for TTL eviction (P1-13 / B-10 fix).
+    pub process_seen:  Arc<DashMap<u32, i64>>,
+    pub web_roots:     Vec<String>,
+    pub system_shells: std::collections::HashSet<String>,
+    pub listening_pids: Arc<dashmap::DashSet<u32>>,
 }
 
 impl HeuristicsEngine {
-    pub fn new(config: Arc<kinnector_config::ConfigManager>) -> Self {
+    pub fn new(
+        config: Arc<kinnector_config::ConfigManager>,
+        web_roots: Vec<String>,
+        system_shells: std::collections::HashSet<String>,
+    ) -> Self {
+        let listening_set = dashmap::DashSet::new();
+        for pid in crate::discovery::discover_listening_pids() {
+            println!("[Warden Startup] Discovered listening server PID: {}", pid);
+            listening_set.insert(pid);
+        }
         Self {
-            process_map:   Arc::new(DashMap::new()),
-            ssh_attempts:  Arc::new(DashMap::new()),
+            process_map:    Arc::new(DashMap::new()),
+            ssh_attempts:   Arc::new(DashMap::new()),
+            process_seen:   Arc::new(DashMap::new()),
             config,
+            web_roots,
+            system_shells,
+            listening_pids: Arc::new(listening_set),
         }
     }
 
@@ -59,29 +81,48 @@ impl HeuristicsEngine {
 
                 let mut is_parent_web = false;
                 let mut is_parent_install = false;
+                let mut install_root_pid = 0u32;
                 let mut parent_exe = String::new();
                 let mut depth = 0u32;
 
                 if let Some(parent) = self.process_map.get(&parent_pid) {
-                    is_parent_web     = parent.is_web_server;
+                    is_parent_web     = parent.is_web_server || self.listening_pids.contains(&parent_pid);
                     is_parent_install = parent.is_install_context;
+                    install_root_pid  = parent.install_root_pid;
                     parent_exe        = parent.exe.clone();
                     depth             = parent.depth + 1;
                 } else {
-                    // Parent not yet tracked — guess from exe
-                    if self.config.is_web_process(&parent_exe) {
+                    // Parent not yet tracked — read exe from /proc/<ppid>/exe (Q-07 / P1-5 fix)
+                    if let Ok(path) = std::fs::read_link(format!("/proc/{}/exe", parent_pid)) {
+                        parent_exe = path.to_string_lossy().to_string();
+                    }
+                    if !parent_exe.is_empty() && (self.config.is_web_process(&parent_exe) || self.listening_pids.contains(&parent_pid)) {
                         is_parent_web = true;
                     }
                 }
 
+                // Update last-seen for TTL eviction (P1-13)
+                self.process_seen.insert(child_pid, Utc::now().timestamp());
+
                 // Classify child
-                let is_child_web     = self.config.is_web_process(&child_exe);
+                let is_child_web     = self.config.is_web_process(&child_exe) || self.listening_pids.contains(&child_pid);
                 let child_lower = child_exe.to_lowercase();
-                let is_child_install = child_lower.contains("npm")
-                    || child_lower.contains("pip")
-                    || child_lower.contains("cargo")
-                    || child_lower.contains("gem")
-                    || child_lower.contains("composer");
+                
+                let install_keywords = [
+                    "npm", "yarn", "pnpm", "pip", "poetry", "pipenv", "composer", 
+                    "cargo", "gem", "bundle", "nuget", "dotnet", "go", 
+                    "apt", "apt-get", "dpkg", "yum", "dnf", "rpm", "pacman", "apk"
+                ];
+                let is_child_install = install_keywords.iter().any(|&kw| {
+                    child_lower == kw || child_lower.ends_with(&format!("/{}", kw))
+                });
+
+                let is_top_level_install = is_child_install && !is_parent_install;
+                let final_install_root = if is_top_level_install {
+                    child_pid
+                } else {
+                    install_root_pid
+                };
 
                 self.process_map.insert(child_pid, ProcessNode {
                     pid: child_pid,
@@ -90,49 +131,51 @@ impl HeuristicsEngine {
                     cmdline: child_cmdline.clone(),
                     is_web_server: is_child_web || is_parent_web,
                     is_install_context: is_child_install || is_parent_install,
+                    is_top_level_install,
+                    install_root_pid: final_install_root,
                     depth,
                 });
 
-                // --- S-A: Web process spawns shell interpreter (SIGKILL) ---
+                // --- S-A: Web process spawned a shell interpreter ---
                 if is_parent_web {
-                    let shell_names = ["/bin/sh", "/bin/bash", "/bin/dash",
-                                      "/bin/zsh", "/bin/ash", "sh", "bash", "dash", "zsh"];
-                    let is_shell = shell_names.iter().any(|s| {
-                        child_exe.ends_with(s) || child_lower == *s
-                    });
+                    let is_shell = self.system_shells.contains(&child_exe)
+                        || self.system_shells.contains(&child_lower)
+                        || self.system_shells.iter().any(|s| child_exe.ends_with(s));
 
                     if is_shell {
-                        self.execute_containment(
+                        self.terminate_threat_child(
                             child_pid, &child_exe, &child_cmdline,
                             &parent_exe, parent_pid,
-                            "Threat.Server.ShellSpawnAttempt", "SIGKILL",
-                            "Web process spawned interactive shell interpreter."
+                            "Threat.Server.ShellSpawnAttempt",
+                            "Web process spawned interactive shell interpreter. Terminated child process."
                         );
                     }
 
-                    // --- S-H: Unregistered inode exec (RFI / webshell) ---
+                    // --- S-H: Unregistered binary executed inside web root ---
+                    // System binaries (/usr/bin, /usr/sbin) are not web-root scoped
+                    // and are never in the allowlist — skip them (B-03 fix).
                     if !child_exe.is_empty() {
-                        if !crate::allowlist::is_inode_allowed(&child_exe) {
-                            self.execute_containment(
+                        let is_in_web_root = self.web_roots.iter().any(|root| child_exe.starts_with(root));
+                        if is_in_web_root
+                            && !crate::allowlist::is_inode_allowed(&child_exe)
+                        {
+                            self.terminate_threat_child(
                                 child_pid, &child_exe, &child_cmdline,
                                 &parent_exe, parent_pid,
-                                "Threat.Server.ExploitInjection", "SIGKILL",
-                                "Unregistered binary executed by web process — not in git/startup inode allowlist."
+                                "Threat.Server.ExploitInjection",
+                                "Unregistered binary inside web root executed by web process. Terminated child process."
                             );
                         }
                     }
 
-                    // --- S-J Trigger 2: Protected binary replacement trigger ---
+                    // --- S-J Trigger 2: Protected binary re-executed by web process ---
                     if self.config.is_protected_binary(&child_exe) {
-                        // Web process re-execing a protected binary — suspicious
-                        self.emit_alert(
-                            "Threat.Server.BinaryOrSourcePoisoned", "CRITICAL",
+                        self.terminate_threat_child(
                             child_pid, &child_exe, &child_cmdline,
                             &parent_exe, parent_pid,
-                            "SIGKILL",
-                            "Web process re-executed a protected server binary.",
+                            "Threat.Server.BinaryOrSourcePoisoned",
+                            "Web process re-executed a protected server binary. Terminated child process."
                         );
-                        unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
                     }
                 }
 
@@ -165,11 +208,45 @@ impl HeuristicsEngine {
             // ProcessStop — evict from map
             // ---------------------------------------------------------------
             EventType::ProcessStop => {
+                let mut pids_to_kill = Vec::new();
+                if let Some(proc) = self.process_map.get(&event_pid) {
+                    if proc.is_top_level_install {
+                        let root_pid = event_pid;
+                        for entry in self.process_map.iter() {
+                            if entry.value().install_root_pid == root_pid && entry.key() != &root_pid {
+                                pids_to_kill.push(*entry.key());
+                            }
+                        }
+                    }
+                }
+
+                for child_pid in pids_to_kill {
+                    if let Some(child_proc) = self.process_map.get(&child_pid) {
+                        let exe = child_proc.exe.clone();
+                        let cmd = child_proc.cmdline.clone();
+                        let ppid = child_proc.ppid;
+                        drop(child_proc);
+
+                        self.terminate_threat_child(
+                            child_pid, &exe, &cmd, "", ppid,
+                            "Vulnerability.SupplyChain.PersistentProcess",
+                            "Process continued running after package installation completed. Terminated process."
+                        );
+                    }
+                }
+
                 self.process_map.remove(&event_pid);
+                self.process_seen.remove(&event_pid);
             }
 
             // ---------------------------------------------------------------
-            // FileOpen — S-B LFI: web process opens sensitive file (alert)
+            // FileOpen — Allowlist enforcement (LFI / unregistered file read)
+            //
+            // Any file opened by a web-context process MUST have its inode in
+            // the git-seeded allowlist.  There is no timing window, no path
+            // extension guess, no "sensitive file" list.  The allowlist IS the
+            // policy.  Exceptions: the kernel-synthesised /proc and /dev paths
+            // are never allowlist-checked (they have no stable inodes).
             // ---------------------------------------------------------------
             EventType::FileOpen => {
                 let details: FileOpenDetails = unsafe {
@@ -177,35 +254,60 @@ impl HeuristicsEngine {
                 };
                 let path = null_terminated_str(&details.file_path);
 
-                if let Some(proc) = self.process_map.get(&event_pid) {
-                    if proc.is_web_server {
-                        // Check against sensitive files from config
-                        let sensitive = self.config.sensitive_files();
-                        let is_sensitive = sensitive.contains_key(&path)
-                            || path.starts_with("/etc/shadow")
-                            || path.starts_with("/root/.ssh");
+                // Skip kernel virtual filesystems
+                if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
+                    return;
+                }
 
-                        if is_sensitive {
-                            let alert_id = format!("lfi-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
-                            let payload = crate::notifications::AlertPayload {
-                                alert_id,
-                                timestamp: Utc::now().to_rfc3339(),
-                                threat_type: "Threat.Server.LFI".to_string(),
-                                severity: "CRITICAL".to_string(),
-                                container: None,
-                                process: crate::notifications::ProcessInfo {
-                                    pid: event_pid,
-                                    exec_path: proc.exe.clone(),
-                                    cmdline: proc.cmdline.clone(),
-                                    parent_exec_path: String::new(),
-                                    parent_pid: proc.ppid,
-                                },
-                                remediation: crate::notifications::RemediationInfo {
-                                    action: "LOG_ALERT".to_string(),
-                                    status: format!("Web process opened sensitive file: {}", path),
-                                },
+                if let Some(proc) = self.process_map.get(&event_pid) {
+                    let is_web = proc.is_web_server;
+                    let is_install = proc.is_install_context;
+                    let exe = proc.exe.clone();
+                    let cmd = proc.cmdline.clone();
+                    let ppid = proc.ppid;
+                    drop(proc);
+
+                    if is_web {
+                        if !crate::allowlist::is_inode_allowed(&path) {
+                            let mode = if crate::allowlist::is_git_seeded() {
+                                "git-indexed"
+                            } else {
+                                "startup-walk-indexed"
                             };
-                            log_and_dispatch(payload);
+                            self.emit_threat(
+                                event_pid, &exe, &cmd, "", ppid,
+                                "Threat.Server.UnregisteredFileRead",
+                                &format!(
+                                    "Web process read a file not present in the {} allowlist: {}",
+                                    mode, path
+                                ),
+                            );
+                        }
+                    }
+
+                    if is_install {
+                        let path_lower = path.to_lowercase();
+                        let is_cred = path_lower.contains("/.ssh/")
+                            || path_lower.contains("/id_rsa")
+                            || path_lower.contains("/id_dsa")
+                            || path_lower.contains("/id_ecdsa")
+                            || path_lower.contains("/id_ed25519")
+                            || path_lower.contains("/.docker/config.json")
+                            || path_lower.contains("/.npmrc")
+                            || path_lower.contains("/.aws/")
+                            || path_lower.contains("/.gitconfig")
+                            || path_lower.contains("/.git-credentials")
+                            || path_lower.contains("/.pypirc")
+                            || path_lower.contains("/.pip/")
+                            || path_lower == "/etc/shadow";
+
+                        if is_cred {
+                            self.terminate_threat_child(
+                                event_pid, &exe, &cmd, "", ppid,
+                                "Vulnerability.SupplyChain.CredentialAccessAttempt",
+                                &format!("Package install process attempted to read sensitive credentials: {}", path)
+                            );
+                            return;
                         }
                     }
                 }
@@ -230,10 +332,9 @@ impl HeuristicsEngine {
                             let cmd = proc.cmdline.clone();
                             let ppid = proc.ppid;
                             drop(proc);
-                            self.execute_containment(
-                                event_pid, &exe, &cmd,
-                                "", ppid,
-                                "Threat.Server.MemoryShellcode", "SIGKILL",
+                            self.emit_threat(
+                                event_pid, &exe, &cmd, "", ppid,
+                                "Threat.Server.MemoryShellcode",
                                 "Web process created anonymous executable memory mapping — likely in-memory shellcode."
                             );
                         }
@@ -260,10 +361,9 @@ impl HeuristicsEngine {
                             let cmd = proc.cmdline.clone();
                             let ppid = proc.ppid;
                             drop(proc);
-                            self.execute_containment(
-                                event_pid, &exe, &cmd,
-                                "", ppid,
-                                "Threat.Server.ReverseShell", "SIGKILL",
+                            self.emit_threat(
+                                event_pid, &exe, &cmd, "", ppid,
+                                "Threat.Server.ReverseShell",
                                 "Web process duplicated socket fd to stdin/stdout — classic reverse shell pattern."
                             );
                         }
@@ -272,7 +372,11 @@ impl HeuristicsEngine {
             }
 
             // ---------------------------------------------------------------
-            // FileWrite / FileCreate — S-I persistence, S-J binary replacement
+            // FileWrite / FileCreate — allowlist enforcement + persistence/S-J
+            //
+            // A web process writing a file that is NOT in the git allowlist is
+            // the canonical unrestricted-upload / RFI-staging pattern.  No
+            // timing window needed: the write itself is the indicator.
             // ---------------------------------------------------------------
             EventType::FileWrite | EventType::FileCreate => {
                 let path = if header.event_type == EventType::FileWrite {
@@ -287,36 +391,94 @@ impl HeuristicsEngine {
                     null_terminated_str(&d.file_path)
                 };
 
-                if let Some(proc) = self.process_map.get(&event_pid) {
-                    let exe = proc.exe.clone();
-                    let cmd = proc.cmdline.clone();
-                    let ppid = proc.ppid;
-                    let is_web = proc.is_web_server;
-                    let is_install = proc.is_install_context;
-                    drop(proc);
+                // Skip kernel virtual filesystems
+                if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
+                    return;
+                }
+                let is_profile = is_profile_like_path(&path);
 
-                    // S-I: Persistence path monitoring — SIGSTOP + alert
-                    if (is_web || is_install) && self.config.is_persistence_path(&path) {
-                        self.execute_containment(
-                            event_pid, &exe, &cmd,
-                            "", ppid,
-                            "Threat.Server.PersistenceTampered", "SIGSTOP",
-                            &format!("Web/install process wrote to persistence path: {}", path),
+                let mut exe = String::new();
+                let mut cmd = String::new();
+                let mut ppid = 0u32;
+                let mut is_web = false;
+                let mut is_install = false;
+
+                if let Some(proc) = self.process_map.get(&event_pid) {
+                    exe       = proc.exe.clone();
+                    cmd       = proc.cmdline.clone();
+                    ppid      = proc.ppid;
+                    is_web    = proc.is_web_server;
+                    is_install = proc.is_install_context;
+                } else {
+                    // Resolve dynamically for untracked processes
+                    if let Ok(link) = std::fs::read_link(format!("/proc/{}/exe", event_pid)) {
+                        exe = link.to_string_lossy().to_string();
+                    }
+                    if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{}/cmdline", event_pid)) {
+                        cmd = cmdline.replace('\0', " ");
+                    }
+                    if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", event_pid)) {
+                        for line in status.lines() {
+                            if line.starts_with("PPid:") {
+                                if let Some(ppid_str) = line.split_whitespace().nth(1) {
+                                    ppid = ppid_str.parse().unwrap_or(0);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // --- Allowlist enforcement: web process writes unregistered file ---
+                if is_web && !crate::allowlist::is_inode_allowed(&path) {
+                    let mode = if crate::allowlist::is_git_seeded() {
+                        "git-indexed"
+                    } else {
+                        "startup-walk-indexed"
+                    };
+                    self.emit_threat(
+                        event_pid, &exe, &cmd, "", ppid,
+                        "Threat.Server.UnregisteredFileWrite",
+                        &format!(
+                            "Web process wrote a file not present in the {} allowlist: {}. \
+                             Possible unrestricted upload / RFI staging / webshell drop.",
+                            mode, path
+                        ),
+                    );
+                }
+
+                // --- S-I: Persistence path / profile monitoring ---
+                if is_web || is_install || is_profile || self.config.is_persistence_path(&path) {
+                    if is_install {
+                        self.terminate_threat_child(
+                            event_pid, &exe, &cmd, "", ppid,
+                            "Vulnerability.SupplyChain.PersistenceAttempt",
+                            &format!("Package install process attempted to establish persistence: {}", path),
+                        );
+                    } else {
+                        let threat_type = if is_profile {
+                            "Threat.Server.ProfileModified"
+                        } else {
+                            "Threat.Server.PersistenceTampered"
+                        };
+                        self.emit_threat(
+                            event_pid, &exe, &cmd, "", ppid,
+                            threat_type,
+                            &format!("Process modified persistence/profile path: {}", path),
                         );
                     }
+                }
 
-                    // S-J Trigger 1: Protected binary written by non-package-manager
-                    if self.config.is_protected_binary(&path) {
-                        let trusted = self.config.is_trusted_cli(&exe, kinnector_config::Category::SystemUpdate);
-                        if !trusted {
-                            self.emit_alert(
-                                "Threat.Server.BinaryOrSourcePoisoned", "CRITICAL",
-                                event_pid, &exe, &cmd,
-                                "", ppid,
-                                "LOG_ALERT",
-                                &format!("Protected binary modified outside package manager: {}", path),
-                            );
-                        }
+                // --- S-J Trigger 1: Protected binary written outside package manager ---
+                if self.config.is_protected_binary(&path) {
+                    let trusted = self.config.is_trusted_cli(&exe, kinnector_config::Category::SystemUpdate);
+                    if !trusted {
+                        self.emit_alert(
+                            "Threat.Server.BinaryOrSourcePoisoned", "CRITICAL",
+                            event_pid, &exe, &cmd, "", ppid,
+                            "LOG_ALERT",
+                            &format!("Protected binary modified outside package manager: {}", path),
+                        );
                     }
                 }
             }
@@ -457,13 +619,13 @@ impl HeuristicsEngine {
                     "command": cmd
                 });
                 if let Ok(s) = serde_json::to_string(&log_entry) {
-                    let _ = write_to_audit_log(&s);
+                    let _ = crate::audit::write_to_audit_log(&s);
                 }
 
                 // Pattern analysis from config
                 for pattern in self.config.terminal_rce_patterns() {
                     if cmd_lower.contains(pattern.as_str()) {
-                        let alert_id = format!("tcmd-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                        let alert_id = uuid::Uuid::new_v4().to_string();
                         let payload = crate::notifications::AlertPayload {
                             alert_id,
                             timestamp: Utc::now().to_rfc3339(),
@@ -488,23 +650,66 @@ impl HeuristicsEngine {
                 }
             }
 
+            EventType::Listen => {
+                if !self.listening_pids.contains(&event_pid) {
+                    println!("[Warden Heuristics] PID {} called listen() -> dynamically promoting to SERVER context.", event_pid);
+                    self.listening_pids.insert(event_pid);
+                }
+                if let Some(mut proc) = self.process_map.get_mut(&event_pid) {
+                    if !proc.is_web_server {
+                        proc.is_web_server = true;
+                    }
+                }
+            }
+
             _ => {}
         }
     }
 
-    fn execute_containment(
+    /// Emit a structured threat alert for a process event.
+    /// Never sends any signal — observation only.
+    fn emit_threat(
+        &self,
+        pid: u32, exe: &str, cmdline: &str,
+        parent_exe: &str, parent_pid: u32,
+        threat_type: &str,
+        desc: &str,
+    ) {
+        let alert_id = uuid::Uuid::new_v4().to_string();
+        let payload = crate::notifications::AlertPayload {
+            alert_id,
+            timestamp: Utc::now().to_rfc3339(),
+            threat_type: threat_type.to_string(),
+            severity: "CRITICAL".to_string(),
+            container: None,
+            process: crate::notifications::ProcessInfo {
+                pid,
+                exec_path: exe.to_string(),
+                cmdline: cmdline.to_string(),
+                parent_exec_path: parent_exe.to_string(),
+                parent_pid,
+            },
+            remediation: crate::notifications::RemediationInfo {
+                action: "LOG_ALERT".to_string(),
+                status: desc.to_string(),
+            },
+        };
+        log_and_dispatch(payload);
+    }
+
+    /// Terminate an unauthorized spawned child process using SIGKILL
+    /// while keeping the parent process (the web server) completely running.
+    fn terminate_threat_child(
         &self,
         child_pid: u32, child_exe: &str, child_cmdline: &str,
         parent_exe: &str, parent_pid: u32,
-        threat_type: &str, action: &str, desc: &str
+        threat_type: &str,
+        desc: &str,
     ) {
-        if action == "SIGKILL" {
-            unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
-        } else if action == "SIGSTOP" {
-            unsafe { libc::kill(child_pid as i32, libc::SIGSTOP); }
-        }
+        // Kill only the child pid representing the threat.
+        unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
 
-        let alert_id = format!("cnt-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        let alert_id = uuid::Uuid::new_v4().to_string();
         let payload = crate::notifications::AlertPayload {
             alert_id,
             timestamp: Utc::now().to_rfc3339(),
@@ -519,7 +724,7 @@ impl HeuristicsEngine {
                 parent_pid,
             },
             remediation: crate::notifications::RemediationInfo {
-                action: action.to_string(),
+                action: "SIGKILL".to_string(),
                 status: format!("Remediation: SUCCESSFUL. {}", desc),
             },
         };
@@ -533,7 +738,7 @@ impl HeuristicsEngine {
         parent_exe: &str, parent_pid: u32,
         action: &str, desc: &str,
     ) {
-        let alert_id = format!("alt-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        let alert_id = uuid::Uuid::new_v4().to_string();
         let payload = crate::notifications::AlertPayload {
             alert_id,
             timestamp: Utc::now().to_rfc3339(),
@@ -554,6 +759,24 @@ impl HeuristicsEngine {
         };
         log_and_dispatch(payload);
     }
+
+    /// Evict stale entries from process_map (B-10 / P1-13 fix).
+    /// Call this periodically from a background task.
+    pub fn evict_stale_processes(&self) {
+        const TTL_SECS: i64 = 1800; // 30 minutes
+        let now = Utc::now().timestamp();
+        let stale_pids: Vec<u32> = self.process_seen
+            .iter()
+            .filter(|entry| now - *entry.value() > TTL_SECS)
+            .map(|entry| *entry.key())
+            .collect();
+        for pid in stale_pids {
+            if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                self.process_map.remove(&pid);
+                self.process_seen.remove(&pid);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -567,28 +790,47 @@ pub fn null_terminated_str(buf: &[u8]) -> String {
 
 fn log_and_dispatch(payload: crate::notifications::AlertPayload) {
     if let Ok(s) = serde_json::to_string(&payload) {
-        let _ = write_to_audit_log(&s);
+        let _ = crate::audit::write_to_audit_log(&s);
     }
     crate::notifications::dispatch_alert(payload);
 }
 
+/// B-05 fix: Use explicit iptables args (no `sh -c`); validate IP address first.
 fn trigger_firewall_block(ip: &str) {
+    // Validate IP before passing to iptables to prevent injection
+    if IpAddr::from_str(ip).is_err() {
+        eprintln!("[Warden Heuristics] Refusing to block invalid IP address: {:?}", ip);
+        return;
+    }
     let ip_owned = ip.to_string();
     tokio::spawn(async move {
-        let cmd = format!("iptables -A INPUT -s {} -j DROP", ip_owned);
-        let _ = tokio::process::Command::new("sh").arg("-c").arg(&cmd).output().await;
+        // Block: explicit args only, no shell interpretation
+        let _ = tokio::process::Command::new("iptables")
+            .args(["-A", "INPUT", "-s", &ip_owned, "-j", "DROP"])
+            .output().await;
         tokio::time::sleep(tokio::time::Duration::from_secs(2 * 3600)).await;
-        let remove_cmd = format!("iptables -D INPUT -s {} -j DROP", ip_owned);
-        let _ = tokio::process::Command::new("sh").arg("-c").arg(&remove_cmd).output().await;
+        // Unblock after 2 hours
+        let _ = tokio::process::Command::new("iptables")
+            .args(["-D", "INPUT", "-s", &ip_owned, "-j", "DROP"])
+            .output().await;
     });
 }
 
-fn write_to_audit_log(line: &str) -> std::io::Result<()> {
-    let _ = std::fs::create_dir_all("/var/log/kinnector");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/var/log/kinnector/audit.log")?;
-    use std::io::Write;
-    writeln!(file, "{}", line)
+fn is_profile_like_path(path: &str) -> bool {
+    let path_lower = path.to_lowercase();
+    path_lower.ends_with("/.bashrc")
+        || path_lower.ends_with("/.profile")
+        || path_lower.ends_with("/.bash_profile")
+        || path_lower.ends_with("/.bash_login")
+        || path_lower.ends_with("/.bash_logout")
+        || path_lower.ends_with("/.zshrc")
+        || path_lower.ends_with("/.zprofile")
+        || path_lower.ends_with("/.zshenv")
+        || path_lower.ends_with("/.zlogout")
+        || path_lower.contains("/etc/profile")
+        || path_lower.ends_with("/etc/bash.bashrc")
+        || path_lower.contains("/etc/profile.d/")
 }
+
+
+// Q-01: write_to_audit_log moved to crate::audit — this local copy is removed.

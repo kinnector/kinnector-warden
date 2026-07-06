@@ -11,6 +11,11 @@ mod discovery;
 mod fim;
 mod ffi;
 mod allowlist;
+mod audit;
+mod ssh_monitor;
+mod quarantine;
+mod api;
+mod tty_logger;
 
 #[derive(Parser, Debug)]
 #[command(name = "wardend")]
@@ -46,8 +51,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/home/user/Documents/kinnector/kinnector-core/build/kinnector.bpf.o"
     };
 
-    let telemetry_socket = "/var/run/kinnector/telemetry.sock";
-    let auth_token = "super-secret-agent-token-12345";
+    // B-08 & Section 1: Load config values from /etc/kinnector/core.conf dynamically
+    let telemetry_socket = args.telemetry_socket.clone();
+    let core_conf = std::fs::read_to_string("/etc/kinnector/core.conf").unwrap_or_default();
+    
+    let auth_token = core_conf.lines()
+        .find(|l| l.starts_with("auth_token="))
+        .map(|l| l.trim_start_matches("auth_token=").trim().to_string())
+        .unwrap_or_default();
+
+    let quarantine_dir = core_conf.lines()
+        .find(|l| l.starts_with("quarantine_dir="))
+        .map(|l| l.trim_start_matches("quarantine_dir=").trim().to_string())
+        .unwrap_or_else(|| "/var/quarantine/kinnector".to_string());
+    crate::quarantine::init_quarantine_dir(quarantine_dir);
+
+    let pid_file_path = core_conf.lines()
+        .find(|l| l.starts_with("pid_file="))
+        .map(|l| l.trim_start_matches("pid_file=").trim().to_string())
+        .unwrap_or_else(|| "/var/run/kinnector/wardend.pid".to_string());
+
+    // Write PID file
+    if let Some(parent) = std::path::Path::new(&pid_file_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let pid = std::process::id();
+    if let Err(e) = std::fs::write(&pid_file_path, pid.to_string()) {
+        eprintln!("[Warden] Warning: could not write PID file {}: {}", pid_file_path, e);
+    } else {
+        println!("[Warden] PID {} written to {}", pid, pid_file_path);
+    }
 
     // 2. Initialize FFI low-level C++ telemetry engine
     let bpf_path_c = std::ffi::CString::new(bpf_path)?;
@@ -99,13 +132,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| kinnector_config::ConfigManager::load_defaults())
     );
 
-    // 4. Seed inode allowlist for the web root
-    let _allowlist = crate::allowlist::seed_inode_allowlist(&args.web_root);
+    // 4. Agnostic dynamic web-roots auto-detection & shell loading
+    let mut web_roots = crate::discovery::discover_web_roots(&config_arc);
+    // Merge user-supplied parameter if not already discovered
+    if !args.web_root.is_empty() && !web_roots.contains(&args.web_root) {
+        web_roots.push(args.web_root.clone());
+    }
 
-    // 5. Initialize EDR Heuristics Engine
-    let heuristics = Arc::new(HeuristicsEngine::new(Arc::clone(&config_arc)));
-
-    // 5. Auto-discover Reverse Proxies
+    // 6. Auto-discover Reverse Proxies
     let proxies = crate::discovery::auto_discover_proxies();
     let mut config_dirs = Vec::new();
     for proxy in proxies {
@@ -115,13 +149,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 7. Start File Integrity Monitoring (FIM)
-    crate::fim::start_fim_watcher(args.web_root.clone(), config_dirs);
+    // P6-1/P6-3: Auto-discover Docker container mounts at startup
+    let docker_containers = crate::discovery::discover_docker_containers().await;
+    for container in docker_containers {
+        println!("[Warden Docker] Monitoring Docker container: {} (Image: {})", container.name, container.image);
+        for wr in container.web_roots {
+            let wr_str = wr.to_string_lossy().to_string();
+            if !web_roots.contains(&wr_str) {
+                web_roots.push(wr_str);
+            }
+        }
+        for cd in container.config_dirs {
+            if !config_dirs.contains(&cd) {
+                config_dirs.push(cd);
+            }
+        }
+    }
+
+    // P6-4: Start event-driven Docker listener to dynamically watch new containers in real-time
+    crate::discovery::start_docker_event_listener();
+
+    println!("[Warden WebRoots] Actively monitoring web roots: {:?}", web_roots);
+
+    let system_shells = crate::allowlist::load_system_shells();
+    println!("[Warden Shells] Dynamically loaded {} login shells from /etc/shells", system_shells.len());
+
+    // 4b. Seed inode allowlist from git (git-authoritative enforcement)
+    let _allowlist = crate::allowlist::seed_inode_allowlist(&web_roots);
+
+    // 4c. Start git commit watchers for all discovered web roots
+    for root in &web_roots {
+        crate::allowlist::start_git_commit_watcher(root.clone());
+    }
+
+    // 5. Initialize EDR Heuristics Engine
+    let heuristics = Arc::new(HeuristicsEngine::new(
+        Arc::clone(&config_arc),
+        web_roots.clone(),
+        system_shells,
+    ));
+
+    // P4-5 & P4-6: Add system persistence and SSL/TLS directories to FIM watch list
+    let extra_fim_paths = [
+        "/etc/cron.d",
+        "/etc/cron.daily",
+        "/etc/cron.hourly",
+        "/etc/cron.monthly",
+        "/etc/cron.weekly",
+        "/etc/crontab",
+        "/var/spool/cron",
+        "/etc/profile",
+        "/etc/profile.d",
+        "/etc/bash.bashrc",
+        "/etc/ssl",
+        "/etc/letsencrypt",
+    ];
+    for path_str in &extra_fim_paths {
+        let path = std::path::Path::new(path_str);
+        if path.exists() {
+            config_dirs.push(std::path::PathBuf::from(path_str));
+        }
+    }
+
+    // 7. Start File Integrity Monitoring (FIM) on the main web roots
+    for root in &web_roots {
+        crate::fim::start_fim_watcher(root.clone(), config_dirs.clone());
+    }
 
     // 8. Start Dependency Vulnerabilities OSV Scanner
-    crate::scanner::start_scanner(args.web_root.clone());
+    for root in &web_roots {
+        crate::scanner::start_scanner(root.clone());
+    }
 
-    // 9. Connect to core eBPF telemetry loop
+    // 8b. Start SSH brute-force monitor (auth log tailer — Phase 3)
+    crate::ssh_monitor::start_ssh_monitor(Arc::clone(&heuristics));
+
+    // 8c. Start HTTP-over-UDS REST API server (Phase 7)
+    crate::api::start_api_server(Arc::clone(&heuristics), web_roots.clone());
+
+    // 8d. Start PTY/TTY logging monitor
+    crate::tty_logger::start_tty_logger();
+
+
+
+    // 9. Periodic process-map TTL eviction (P1-13 / B-10 fix)
+    {
+        let engine_evict = Arc::clone(&heuristics);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await; // every 5 min
+                engine_evict.evict_stale_processes();
+            }
+        });
+    }
+
+    // 10. Connect to core eBPF telemetry loop
     let telemetry_path = args.telemetry_socket.clone();
     let engine_clone = Arc::clone(&heuristics);
     
@@ -186,6 +308,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Warden daemon stopped.");
+    // Remove PID file on clean exit (P1-9)
+    let _ = std::fs::remove_file(pid_file_path);
     // Cleanup low-level telemetry resources
     unsafe { ffi::stop_telemetry_engine(); }
     Ok(())
