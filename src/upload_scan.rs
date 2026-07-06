@@ -36,27 +36,7 @@ pub async fn scan_uploaded_file(file_path: &str) -> ScanResult {
         return ScanResult::Elf;
     }
 
-    // Check 2: Polyglot Detection
-    let is_image = if bytes_read >= 3 && buffer[0..3] == [0xFF, 0xD8, 0xFF] {
-        true // JPEG
-    } else if bytes_read >= 8 && buffer[0..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-        true // PNG
-    } else if bytes_read >= 6 && (buffer[0..6] == *b"GIF87a" || buffer[0..6] == *b"GIF89a") {
-        true // GIF
-    } else {
-        false
-    };
 
-    if is_image {
-        let content = String::from_utf8_lossy(&buffer[..bytes_read]);
-        let has_script = content.contains("<?php")
-            || content.contains("<?=")
-            || content.contains("<%")
-            || content.contains("#!/");
-        if has_script {
-            return ScanResult::Suspicious("Polyglot image containing server-side script tags".to_string());
-        }
-    }
 
     // Check 3: Double-Extension Detection
     if let Some(filename) = path.file_name() {

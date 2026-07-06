@@ -625,15 +625,21 @@ impl HeuristicsEngine {
                         crate::storage_discovery::enqueue_upload_scan(path.clone(), alert_id);
                         return;
                     }
-                    let in_tmp = path.starts_with("/tmp/") || path.starts_with("/var/tmp/") || path.starts_with("/dev/shm/");
-                    if in_tmp {
-                        let alert_id = uuid::Uuid::new_v4().to_string();
-                        crate::storage_discovery::enqueue_upload_scan(path.clone(), alert_id);
-                        return;
-                    }
                 }
 
                 if is_web && !crate::allowlist::is_inode_allowed(&path) {
+                    if path.ends_with("wp-config.php") {
+                        self.emit_alert(
+                            "Warning.Server.WordPressConfigModified", "WARNING",
+                            event_pid, &exe, &cmd,
+                            "", ppid,
+                            "LOG_ALERT",
+                            &format!("WordPress config modified by web process (permitted with warning): {}", path),
+                        );
+                        crate::allowlist::register_inode(&path);
+                        return;
+                    }
+
                     let mode = if crate::allowlist::is_git_seeded() {
                         "git-indexed"
                     } else {
@@ -731,10 +737,26 @@ impl HeuristicsEngine {
                 if is_web {
                     let dst_in_web_root = self.web_roots.iter().any(|r| dest.starts_with(r));
                     if dst_in_web_root {
-                        if let Some(_storage) = crate::storage_discovery::is_in_storage(std::path::Path::new(&dest)) {
+                        if dest.ends_with("wp-config.php") {
+                            self.emit_alert(
+                                "Warning.Server.WordPressConfigModified", "WARNING",
+                                event_pid, &exe, &cmd,
+                                "", ppid,
+                                "LOG_ALERT",
+                                &format!("WordPress config modified via rename (permitted with warning): {} -> {}", src, dest),
+                            );
+                            crate::allowlist::register_inode(&dest);
+                            return;
+                        } else if let Some(_storage) = crate::storage_discovery::is_in_storage(std::path::Path::new(&dest)) {
                             let alert_id = uuid::Uuid::new_v4().to_string();
                             crate::storage_discovery::enqueue_upload_scan(dest.clone(), alert_id);
                         } else {
+                            let src_in_tmp = src.starts_with("/tmp/") || src.starts_with("/var/tmp/") || src.starts_with("/dev/shm/");
+                            if src_in_tmp {
+                                // Allow the rename without quarantine/alert so /tmp movement is seamless
+                                return;
+                            }
+
                             let alert_id = uuid::Uuid::new_v4().to_string();
                             let reason = format!(
                                 "Web process attempted to write/rename file outside storage: {} -> {}",
