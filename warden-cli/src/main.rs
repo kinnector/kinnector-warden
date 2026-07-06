@@ -568,30 +568,16 @@ fn cmd_containers() {
 // ---------------------------------------------------------------------------
 fn cmd_test_alert() {
     println!("{}", "[warden-cli] Firing test alert to all notification endpoints...".bold());
-    let test_payload = serde_json::json!({
-        "alert_id": format!("test-{}", chrono::Utc::now().timestamp()),
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "threat_type": "Test.Alert",
-        "severity": "LOW",
-        "container": null,
-        "process": {
-            "pid": 0,
-            "exec_path": "warden-cli",
-            "cmdline": "test-alert",
-            "parent_exec_path": "operator",
-            "parent_pid": 0
-        },
-        "remediation": {
-            "action": "TEST",
-            "status": "This is a test alert from warden-cli. All systems operational."
+    match query_daemon("POST", "/api/v1/test-alert", None) {
+        Ok(res) => {
+            let alert_id = res.get("alert_id").and_then(|id| id.as_str()).unwrap_or("unknown");
+            println!("{}", format!("Test alert successfully triggered via API (ID: {}).", alert_id).green());
+            println!("Check Slack, Discord, Telegram, custom webhooks, and local audit logs.");
         }
-    });
-    let _ = std::fs::create_dir_all("/var/log/kinnector");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(AUDIT_LOG) {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", test_payload);
+        Err(e) => {
+            eprintln!("Failed to fire test alert: {}", e.red());
+        }
     }
-    println!("{}", "Test alert written to audit log. Check notification endpoints.".green());
 }
 
 // ---------------------------------------------------------------------------

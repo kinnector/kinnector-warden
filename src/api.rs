@@ -277,6 +277,29 @@ async fn handle_http_request(
                 _ => build_error_response(400, "Missing quarantine_path or original_path"),
             }
         }
+        ("POST", "/api/v1/test-alert") => {
+            let alert_id = format!("test-{}", chrono::Utc::now().timestamp());
+            let payload = crate::notifications::AlertPayload {
+                alert_id: alert_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                threat_type: "Test.Alert".to_string(),
+                severity: "LOW".to_string(),
+                container: None,
+                process: crate::notifications::ProcessInfo {
+                    pid: 0,
+                    exec_path: "warden-cli".to_string(),
+                    cmdline: "test-alert".to_string(),
+                    parent_exec_path: "operator".to_string(),
+                    parent_pid: 0,
+                },
+                remediation: crate::notifications::RemediationInfo {
+                    action: "TEST".to_string(),
+                    status: "This is a test alert from warden-cli. All systems operational.".to_string(),
+                },
+            };
+            crate::notifications::dispatch_alert(payload);
+            build_json_response(200, &json!({ "status": "dispatched", "alert_id": alert_id }))
+        }
         _ => build_error_response(404, "Not Found"),
     }
 }
