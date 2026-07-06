@@ -423,3 +423,64 @@ fn parse_yarn_lock(content: &str, deps: &mut Vec<DetectedDependency>, path: &str
         }
     }
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InventoryPackage {
+    pub name: String,
+    pub version: String,
+    pub ecosystem: String,
+    pub lock_file: String,
+    pub is_dev: bool,
+}
+
+pub fn get_installed_packages(root_dir: &str) -> Vec<InventoryPackage> {
+    let lock_files = find_lock_files(Path::new(root_dir), 0);
+    let mut dependencies = Vec::new();
+
+    for (path, file_type) in lock_files {
+        let path_str = path.to_string_lossy().to_string();
+        let mut deps = Vec::new();
+        match file_type {
+            LockFileType::PackageLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_package_lock(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::Requirements => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_requirements(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::PipfileLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_pipfile_lock(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::ComposerLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_composer_lock(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::PoetryLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_poetry_lock(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::YarnLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_yarn_lock(&content, &mut deps, &path_str);
+                }
+            }
+        }
+        for d in deps {
+            dependencies.push(InventoryPackage {
+                name: d.name,
+                version: d.version,
+                ecosystem: d.ecosystem_key,
+                lock_file: d.lock_file_path,
+                is_dev: d.is_dev,
+            });
+        }
+    }
+    dependencies
+}

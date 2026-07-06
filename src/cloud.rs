@@ -84,10 +84,17 @@ pub fn start_cloud_services(heuristics: Arc<HeuristicsEngine>) {
     start_log_streamer(client);
 
     // 3. Start cloud-initiated command listener
-    start_command_listener(heuristics, client);
+    start_command_listener(Arc::clone(&heuristics), client);
 
     // 4. Start forensic offline recovery uploader (every 5 minutes)
     start_forensic_uploader(client);
+
+    // 5. Start initial inventory sync on boot (after 15 seconds)
+    let heuristics_clone = Arc::clone(&heuristics);
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(15)).await;
+        send_inventory_sync(&heuristics_clone).await;
+    });
 }
 
 pub async fn sync_rules_now(config: &Arc<kinnector_config::ConfigManager>) -> bool {
@@ -309,7 +316,7 @@ fn start_command_listener(heuristics: Arc<HeuristicsEngine>, client: &'static Cl
                 Ok(res) => {
                     if res.status().is_success() {
                         if let Ok(cmd_json) = res.json::<serde_json::Value>().await {
-                            process_cloud_command(cmd_json, &heuristics).await;
+                            process_cloud_command(cmd_json, Arc::clone(&heuristics)).await;
                         }
                     }
                 }
@@ -322,7 +329,7 @@ fn start_command_listener(heuristics: Arc<HeuristicsEngine>, client: &'static Cl
     });
 }
 
-async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEngine) {
+async fn process_cloud_command(cmd: serde_json::Value, heuristics: Arc<HeuristicsEngine>) {
     let Some(action) = cmd.get("action").and_then(|a| a.as_str()) else { return; };
     println!("[Warden Cloud] Received remote control command: {}", action);
     match action {
@@ -437,8 +444,73 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEn
                 crate::allowlist::deregister_path_recursive(path);
             }
         }
+        "sync_inventory" | "inventory_sync" => {
+            println!("[Warden Cloud] Remote command: Triggering immediate inventory sync");
+            let heuristics_clone = Arc::clone(&heuristics);
+            tokio::spawn(async move {
+                send_inventory_sync(&heuristics_clone).await;
+            });
+        }
         _ => {
             eprintln!("[Warden Cloud] Unknown remote command action: {}", action);
+        }
+    }
+}
+
+pub async fn send_inventory_sync(heuristics: &HeuristicsEngine) {
+    let client = get_client();
+    let Some(endpoint) = &client.cloud_endpoint else { return; };
+
+    let mut containers = Vec::new();
+    let mounts = crate::discovery::get_active_container_mounts();
+    for entry in mounts.iter() {
+        containers.push(serde_json::json!({
+            "container_id": entry.key(),
+            "mounts": entry.value().iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>()
+        }));
+    }
+
+    let mut proxies = Vec::new();
+    for p in crate::discovery::auto_discover_proxies() {
+        proxies.push(serde_json::json!({
+            "name": p.name,
+            "config_dirs": p.config_dirs.iter().map(|f| f.to_string_lossy()).collect::<Vec<_>>(),
+            "access_logs": p.access_logs.iter().map(|f| f.to_string_lossy()).collect::<Vec<_>>(),
+        }));
+    }
+
+    let mut listening_ports = Vec::new();
+    for pid in heuristics.listening_pids.iter() {
+        listening_ports.push(*pid);
+    }
+
+    let mut packages = Vec::new();
+    for root in &heuristics.web_roots {
+        packages.extend(crate::scanner::get_installed_packages(root));
+    }
+
+    let payload = serde_json::json!({
+        "web_roots": heuristics.web_roots,
+        "proxies": proxies,
+        "listening_pids": listening_ports,
+        "containers": containers,
+        "packages": packages,
+    });
+
+    let url = format!("{}/api/v1/agent/inventory", endpoint);
+    let http_client = reqwest::Client::new();
+    let mut req = http_client.post(&url)
+        .json(&payload);
+    if let Some(key) = &client.license_key {
+        req = req.header("X-License-Key", key);
+    }
+
+    match req.send().await {
+        Ok(res) if res.status().is_success() => {
+            println!("[Warden Cloud] Host inventory successfully synced to fleet manager.");
+        }
+        _ => {
+            eprintln!("[Warden Cloud] Failed to sync host inventory to fleet manager.");
         }
     }
 }

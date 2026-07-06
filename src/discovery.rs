@@ -501,7 +501,7 @@ use std::sync::{Arc, OnceLock};
 
 static ACTIVE_CONTAINER_MOUNTS: OnceLock<Arc<DashMap<String, Vec<PathBuf>>>> = OnceLock::new();
 
-fn get_active_container_mounts() -> &'static Arc<DashMap<String, Vec<PathBuf>>> {
+pub fn get_active_container_mounts() -> &'static Arc<DashMap<String, Vec<PathBuf>>> {
     ACTIVE_CONTAINER_MOUNTS.get_or_init(|| Arc::new(DashMap::new()))
 }
 
