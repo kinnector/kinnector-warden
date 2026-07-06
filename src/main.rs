@@ -18,6 +18,7 @@ mod api;
 mod tty_logger;
 mod tls_buffer;
 mod cloud;
+mod ssh_hardening;
 
 #[derive(Parser, Debug)]
 #[command(name = "wardend")]
@@ -308,6 +309,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 8f. Start Cloud Services (updates, streaming, remote commands)
     crate::cloud::start_cloud_services(Arc::clone(&heuristics));
 
+    // 8g. Start SSH Hardening Audit and Adaptive MOTD Updater
+    tokio::spawn(async {
+        loop {
+            let hardened = crate::ssh_hardening::audit_ssh_2fa();
+            crate::ssh_hardening::update_motd(hardened);
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+        }
+    });
+
 
 
     // 9. Periodic process-map TTL eviction (P1-13 / B-10 fix)
@@ -388,6 +398,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Warden daemon stopped.");
     // Remove proxy redirection iptables rules on exit
     crate::tls_buffer::remove_proxy_routing();
+    // Remove SSH hardening banners from MOTD on exit
+    crate::ssh_hardening::remove_motd_banners();
     // Remove PID file on clean exit (P1-9)
     let _ = std::fs::remove_file(pid_file_path);
     // Cleanup low-level telemetry resources
