@@ -364,6 +364,21 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEn
                 let _ = sync_rules_now(&config_clone).await;
             });
         }
+        "push_rules" => {
+            if let Some(rules_hex) = cmd.get("rules_hex").and_then(|r| r.as_str()) {
+                println!("[Warden Cloud] Remote command: Received rules push payload over stream.");
+                if let Some(bytes) = hex_to_bytes(rules_hex) {
+                    match heuristics.config.reload_from_bytes(&bytes) {
+                        Ok(_) => {
+                            println!("[Warden Cloud] Rules updated and activated successfully from stream payload.");
+                        }
+                        Err(e) => {
+                            eprintln!("[Warden Cloud] Failed to load rules pushed over stream: {}", e);
+                        }
+                    }
+                }
+            }
+        }
         "fim_add" => {
             if let Some(path) = cmd.get("path").and_then(|p| p.as_str()) {
                 println!("[Warden Cloud] Remote command: Adding FIM watch path {}", path);
@@ -374,6 +389,17 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEn
             eprintln!("[Warden Cloud] Unknown remote command action: {}", action);
         }
     }
+}
+
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 { return None; }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte_str = &hex[i..i+2];
+        let byte = u8::from_str_radix(byte_str, 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
 }
 
 pub fn send_alert_immediate(payload: &crate::notifications::AlertPayload) {
