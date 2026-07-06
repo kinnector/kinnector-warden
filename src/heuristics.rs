@@ -178,19 +178,22 @@ impl HeuristicsEngine {
                         );
                     }
 
-                    // --- S-H: Unregistered binary executed inside web root ---
-                    // System binaries (/usr/bin, /usr/sbin) are not web-root scoped
-                    // and are never in the allowlist — skip them (B-03 fix).
+                    // --- S-H: Unregistered binary execution check ---
+                    // System binaries (/usr/bin, /usr/sbin, etc.) are allowed by default,
+                    // but any binary outside system directories must be explicitly allowlisted.
                     if !child_exe.is_empty() {
-                        let is_in_web_root = self.web_roots.iter().any(|root| child_exe.starts_with(root));
-                        if is_in_web_root
-                            && !crate::allowlist::is_inode_allowed(&child_exe)
-                        {
+                        let is_system_path = child_exe.starts_with("/bin/") || child_exe.starts_with("/sbin/") ||
+                            child_exe.starts_with("/usr/bin/") || child_exe.starts_with("/usr/sbin/") ||
+                            child_exe.starts_with("/usr/local/bin/") || child_exe.starts_with("/usr/libexec/") ||
+                            child_exe.starts_with("/lib/") || child_exe.starts_with("/lib64/") ||
+                            child_exe.starts_with("/usr/lib/") || child_exe.starts_with("/usr/lib64/");
+                        
+                        if !is_system_path && !crate::allowlist::is_inode_allowed(&child_exe) {
                             self.terminate_threat_child(
                                 child_pid, &child_exe, &child_cmdline,
                                 &parent_exe, parent_pid,
                                 "Threat.Server.ExploitInjection",
-                                "Unregistered binary inside web root executed by web process. Terminated child process."
+                                "Unregistered binary execution attempted by web process. Terminated child process."
                             );
                         }
                     }
