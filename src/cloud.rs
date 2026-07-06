@@ -318,6 +318,17 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEn
                 let _ = crate::quarantine::restore_file(qp, op);
             }
         }
+        "quarantine_file" => {
+            if let Some(path) = cmd.get("path").and_then(|p| p.as_str()) {
+                println!("[Warden Cloud] Remote command: Quarantining file path {}", path);
+                let alert_id = uuid::Uuid::new_v4().to_string();
+                let _ = crate::quarantine::quarantine_file(
+                    path,
+                    &alert_id,
+                    "Remote-initiated quarantine command from fleet manager"
+                );
+            }
+        }
         "block_ip" => {
             if let Some(ip) = cmd.get("ip").and_then(|i| i.as_str()) {
                 println!("[Warden Cloud] Remote command: Blocking IP {}", ip);
