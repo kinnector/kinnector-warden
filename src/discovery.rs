@@ -414,7 +414,7 @@ pub fn start_docker_event_listener() {
         }
 
         use tokio::net::UnixStream;
-        use tokio::io::{AsyncWriteExt, BufReader, AsyncBufReadExt};
+        use tokio::io::{AsyncWriteExt, BufReader, AsyncBufReadExt, AsyncReadExt};
 
         loop {
             let mut stream = match UnixStream::connect(socket_path).await {
@@ -442,21 +442,50 @@ pub fn start_docker_event_listener() {
                 }
             }
 
-            // Read JSON events
+            // Read JSON events using standard HTTP chunked decoding
             loop {
                 line.clear();
                 match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
                         let trimmed = line.trim();
-                        if trimmed.is_empty() || trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                        if trimmed.is_empty() {
                             continue;
                         }
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                            let action = event.get("Action").and_then(|a| a.as_str()).unwrap_or("");
-                            let id = event.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            if (action == "start" || action == "die" || action == "stop") && !id.is_empty() {
-                                trigger_container_reconfig(id, action).await;
+                        
+                        // Parse chunk size (hex)
+                        let hex_str = trimmed.split(';').next().unwrap_or(trimmed).trim();
+                        let chunk_size = match usize::from_str_radix(hex_str, 16) {
+                            Ok(size) => size,
+                            Err(_) => break,
+                        };
+                        
+                        if chunk_size == 0 {
+                            break;
+                        }
+                        
+                        // Read exactly chunk_size bytes
+                        let mut chunk_buf = vec![0u8; chunk_size];
+                        if reader.read_exact(&mut chunk_buf).await.is_err() {
+                            break;
+                        }
+                        
+                        // Consume trailing CRLF
+                        let mut crlf = [0u8; 2];
+                        if reader.read_exact(&mut crlf).await.is_err() {
+                            break;
+                        }
+                        
+                        if let Ok(utf8_str) = String::from_utf8(chunk_buf) {
+                            let trimmed_payload = utf8_str.trim();
+                            if !trimmed_payload.is_empty() {
+                                if let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed_payload) {
+                                    let action = event.get("Action").and_then(|a| a.as_str()).unwrap_or("");
+                                    let id = event.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                                    if (action == "start" || action == "die" || action == "stop") && !id.is_empty() {
+                                        trigger_container_reconfig(id, action).await;
+                                    }
+                                }
                             }
                         }
                     }

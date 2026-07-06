@@ -106,13 +106,34 @@ fn get_config() -> &'static TlsBufferConfig {
     })
 }
 
+static IS_PAID_TIER: OnceLock<bool> = OnceLock::new();
+
 pub fn is_paid_tier() -> bool {
-    let conf = std::fs::read_to_string("/etc/kinnector/core.conf").unwrap_or_default();
-    conf.lines()
-        .find(|l| l.starts_with("license_key="))
-        .map(|l| l.trim_start_matches("license_key=").trim())
-        .map(|val| !val.is_empty() && val != "free")
-        .unwrap_or(false)
+    *IS_PAID_TIER.get_or_init(|| {
+        let conf = std::fs::read_to_string("/etc/kinnector/core.conf").unwrap_or_default();
+        conf.lines()
+            .find(|l| l.starts_with("license_key="))
+            .map(|l| l.trim_start_matches("license_key=").trim())
+            .map(|val| !val.is_empty() && val != "free")
+            .unwrap_or(false)
+    })
+}
+
+pub fn get_tls_forensics_status() -> serde_json::Value {
+    let is_paid = is_paid_tier();
+    serde_json::json!({
+        "supported_layers": [1, 2, 3, 4],
+        "active_layers": if is_paid { vec![1, 2, 3] } else { vec![] },
+        "layer_status": {
+            "layer_1_uprobe": if is_paid { "active" } else { "disabled_free_tier" },
+            "layer_2_jvmti": if is_paid { "active" } else { "disabled_free_tier" },
+            "layer_3_ktls": if is_paid { "active" } else { "disabled_free_tier" },
+            "layer_4_proxy": "disabled"
+        },
+        "overhead_warnings": {
+            "layer_4_proxy": "High CPU and connection latency overhead if enabled"
+        }
+    })
 }
 
 fn should_exclude_payload(payload: &[u8]) -> bool {
@@ -130,6 +151,9 @@ fn should_exclude_payload(payload: &[u8]) -> bool {
 }
 
 pub fn add_record(record: TlsRecord) {
+    if crate::allowlist::get_disabled_tls_pids().contains(&record.pid) {
+        return;
+    }
     if should_exclude_payload(&record.payload) {
         return;
     }

@@ -391,7 +391,7 @@ fn cmd_quarantine(action: QuarantineAction) {
 fn cmd_firewall(action: FirewallAction) {
     match action {
         FirewallAction::List => {
-            println!("{}", "=== Blocked IPs (iptables) ===".bold().cyan());
+            println!("{}", "=== Blocked IPv4 IPs (iptables) ===".bold().cyan());
             let output = std::process::Command::new("iptables")
                 .args(["-L", "INPUT", "-n"])
                 .output();
@@ -406,11 +406,32 @@ fn cmd_firewall(action: FirewallAction) {
                 }
                 Err(e) => eprintln!("Failed to run iptables: {}", e),
             }
+
+            println!("{}", "=== Blocked IPv6 IPs (ip6tables) ===".bold().cyan());
+            let output6 = std::process::Command::new("ip6tables")
+                .args(["-L", "INPUT", "-n"])
+                .output();
+            match output6 {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for line in text.lines() {
+                        if line.contains("DROP") {
+                            println!("  {}", line.red());
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Failed to run ip6tables: {}", e),
+            }
         }
         FirewallAction::Unblock { ip } => {
             println!("[warden-cli] Unblocking IP: {}", ip.yellow());
-            // Use explicit iptables arguments (P1-3 agnosticism)
-            let out = std::process::Command::new("iptables")
+            use std::str::FromStr;
+            let binary = if let Ok(ip_addr) = std::net::IpAddr::from_str(&ip) {
+                if ip_addr.is_ipv6() { "ip6tables" } else { "iptables" }
+            } else {
+                "iptables"
+            };
+            let out = std::process::Command::new(binary)
                 .args(["-D", "INPUT", "-s", &ip, "-j", "DROP"])
                 .output();
             match out {
@@ -552,14 +573,39 @@ fn cmd_rules(action: RulesAction) {
 // ---------------------------------------------------------------------------
 fn cmd_containers() {
     println!("{}", "=== Monitored Containers ===".bold().cyan());
-    let output = std::process::Command::new("docker")
-        .args(["ps", "--format", "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            print!("{}", String::from_utf8_lossy(&out.stdout));
+    match query_daemon("GET", "/api/v1/containers", None) {
+        Ok(serde_json::Value::Array(list)) => {
+            if list.is_empty() {
+                println!("{}", "  No containers currently monitored.".yellow());
+                return;
+            }
+            println!("{:<12} {:<20} {:<25} {:<30}", "CONTAINER ID", "NAME", "IMAGE", "MONITORED MOUNTS");
+            for item in list {
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let short_id = if id.len() > 12 { &id[..12] } else { id };
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let image = item.get("image").and_then(|v| v.as_str()).unwrap_or("");
+
+                let mut mounts = Vec::new();
+                if let Some(roots) = item.get("web_roots").and_then(|v| v.as_array()) {
+                    for r in roots {
+                        if let Some(s) = r.as_str() {
+                            mounts.push(format!("web:{}", s));
+                        }
+                    }
+                }
+                if let Some(configs) = item.get("config_dirs").and_then(|v| v.as_array()) {
+                    for c in configs {
+                        if let Some(s) = c.as_str() {
+                            mounts.push(format!("cfg:{}", s));
+                        }
+                    }
+                }
+                let mounts_str = mounts.join(", ");
+                println!("{:<12} {:<20} {:<25} {:<30}", short_id, name, image, mounts_str);
+            }
         }
-        _ => println!("{}", "Docker not available or no containers running.".yellow()),
+        _ => eprintln!("{}", "Failed to query containers endpoint on daemon.".red()),
     }
 }
 

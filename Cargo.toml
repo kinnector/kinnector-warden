@@ -19,3 +19,11 @@ uuid = { version = "1", features = ["v4"] }
 kinnector-config = { path = "../kinnector-config" }
 regex = "1.10"
 zstd = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tonic = { version = "0.10", features = ["tls-webpki-roots"] }
+prost = "0.12"
+futures-core = "0.3"
+
+[build-dependencies]
+tonic-build = "0.10"

@@ -32,11 +32,17 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Kinnector Warden Server EDR Daemon (wardend) starting... ===");
+    // Initialize structured logging with env-filter
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive(tracing::Level::INFO.into()))
+        .init();
+
+    tracing::info!("=== Kinnector Warden Server EDR Daemon (wardend) starting... ===");
 
     // Check for root privileges (necessary for process containment/killing and socket bindings)
     if unsafe { libc::getuid() } != 0 {
-        eprintln!("Error: wardend must be run with root privileges (sudo).");
+        tracing::error!("Error: wardend must be run with root privileges (sudo).");
         std::process::exit(1);
     }
 
@@ -49,9 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let env_path = std::env::var("KINNECTOR_BPF_PATH").ok();
         if env_path.as_deref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false) {
             // env override exists — use it (development mode)
-            println!("[Warden] DEV: Using BPF object from KINNECTOR_BPF_PATH env override.");
+            tracing::info!("[Warden] DEV: Using BPF object from KINNECTOR_BPF_PATH env override.");
         } else {
-            eprintln!(
+            tracing::error!(
                 "[Warden] Fatal: BPF object not found at '{}'. \
                  Install the kinnector-core package or set KINNECTOR_BPF_PATH for development builds.",
                 bpf_path
@@ -100,9 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let pid = std::process::id();
     if let Err(e) = std::fs::write(&pid_file_path, pid.to_string()) {
-        eprintln!("[Warden] Warning: could not write PID file {}: {}", pid_file_path, e);
+        tracing::warn!("[Warden] Warning: could not write PID file {}: {}", pid_file_path, e);
     } else {
-        println!("[Warden] PID {} written to {}", pid, pid_file_path);
+        tracing::info!("[Warden] PID {} written to {}", pid, pid_file_path);
     }
 
     // 2. Initialize FFI low-level C++ telemetry engine
@@ -110,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path_c = std::ffi::CString::new(telemetry_socket)?;
     let auth_token_c = std::ffi::CString::new(auth_token)?;
 
-    println!("[Warden] Initializing low-level C++ telemetry engine...");
+    tracing::info!("[Warden] Initializing low-level C++ telemetry engine...");
     let init_success = unsafe {
         ffi::initialize_telemetry_engine(
             bpf_path_c.as_ptr(),
@@ -120,14 +126,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !init_success {
-        eprintln!("[Warden] Failed to initialize C++ telemetry engine via FFI!");
+        tracing::error!("[Warden] Failed to initialize C++ telemetry engine via FFI!");
         std::process::exit(1);
     }
 
-    println!("[Warden] Starting low-level C++ telemetry engine...");
+    tracing::info!("[Warden] Starting low-level C++ telemetry engine...");
     let start_success = unsafe { ffi::start_telemetry_engine() };
     if !start_success {
-        eprintln!("[Warden] Failed to start C++ telemetry engine!");
+        tracing::error!("[Warden] Failed to start C++ telemetry engine!");
         std::process::exit(1);
     }
 
@@ -135,13 +141,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rules_path = "/etc/kinnector/rules.db";
     let public_key = [25, 127, 107, 35, 225, 108, 133, 50, 198, 171, 200, 56, 250, 205, 94, 167, 137, 190, 12, 118, 178, 146, 3, 52, 3, 155, 250, 139, 61, 54, 141, 97];
     if let Ok(mgr) = kinnector_config::ConfigManager::load(rules_path, &public_key) {
-        println!("[Warden] Rules database loaded successfully from {}", rules_path);
+        tracing::info!("[Warden] Rules database loaded successfully from {}", rules_path);
         let sensitive_files = mgr.sensitive_files();
         use std::os::unix::fs::MetadataExt;
         for (path_str, category_flags) in sensitive_files {
             if let Ok(metadata) = std::fs::metadata(&path_str) {
                 let inode = metadata.ino();
-                println!("[Warden] Registering sensitive file: {} (Inode: {}, Category: {:#x})", path_str, inode, category_flags);
+                tracing::debug!("[Warden] Registering sensitive file: {} (Inode: {}, Category: {:#x})", path_str, inode, category_flags);
                 unsafe {
                     ffi::add_sensitive_inode(inode, category_flags);
                 }
@@ -166,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxies = crate::discovery::auto_discover_proxies();
     let mut config_dirs = Vec::new();
     for proxy in proxies {
-        println!("[Warden Discovery] Discovered active reverse proxy: {}", proxy.name);
+        tracing::info!("[Warden Discovery] Discovered active reverse proxy: {}", proxy.name);
         for conf_dir in proxy.config_dirs {
             config_dirs.push(conf_dir);
         }
@@ -175,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // P6-1/P6-3: Auto-discover Docker container mounts at startup
     let docker_containers = crate::discovery::discover_docker_containers().await;
     for container in docker_containers {
-        println!("[Warden Docker] Monitoring Docker container: {} (Image: {})", container.name, container.image);
+        tracing::info!("[Warden Docker] Monitoring Docker container: {} (Image: {})", container.name, container.image);
         let mut mounts = Vec::new();
         for wr in container.web_roots {
             let wr_str = wr.to_string_lossy().to_string();
@@ -196,10 +202,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // P6-4: Start event-driven Docker listener to dynamically watch new containers in real-time
     crate::discovery::start_docker_event_listener();
 
-    println!("[Warden WebRoots] Actively monitoring web roots: {:?}", web_roots);
+    tracing::info!("[Warden WebRoots] Actively monitoring web roots: {:?}", web_roots);
 
     let system_shells = crate::allowlist::load_system_shells();
-    println!("[Warden Shells] Dynamically loaded {} login shells from /etc/shells", system_shells.len());
+    tracing::info!("[Warden Shells] Dynamically loaded {} login shells from /etc/shells", system_shells.len());
 
     // 4b. Seed inode allowlist from git (git-authoritative enforcement)
     let _allowlist = crate::allowlist::seed_inode_allowlist(&web_roots);
@@ -247,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         install_root_pid: 0,
                         depth: 0,
                     });
-                    println!("[Warden Startup] Pre-seeded process map: PID {} ({})", pid, exe);
+                    tracing::info!("[Warden Startup] Pre-seeded process map: PID {} ({})", pid, exe);
                 }
             }
         }
@@ -319,11 +325,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_clone = Arc::clone(&heuristics);
     
     tokio::spawn(async move {
-        println!("[Warden Telemetry] Attempting connection to telemetry stream: {}", telemetry_path);
+        tracing::info!("[Warden Telemetry] Attempting connection to telemetry stream: {}", telemetry_path);
         loop {
             match tokio::net::UnixStream::connect(&telemetry_path).await {
                 Ok(mut stream) => {
-                    println!("[Warden Telemetry] Connected to eBPF telemetry socket successfully.");
+                    tracing::info!("[Warden Telemetry] Connected to eBPF telemetry socket successfully.");
                     let mut buffer = vec![0u8; RAW_EVENT_SIZE * 4];
                     let mut bytes_in_buf = 0;
 
@@ -331,7 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         use tokio::io::AsyncReadExt;
                         match stream.read(&mut buffer[bytes_in_buf..]).await {
                             Ok(0) => {
-                                println!("[Warden Telemetry] Stream EOF. Reconnecting...");
+                                tracing::info!("[Warden Telemetry] Stream EOF. Reconnecting...");
                                 break;
                             }
                             Ok(n) => {
@@ -353,7 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[Warden Telemetry] Socket read error: {}. Reconnecting...", e);
+                                tracing::error!("[Warden Telemetry] Socket read error: {}. Reconnecting...", e);
                                 break;
                             }
                         }
@@ -371,14 +377,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("Warden shutdown requested via Ctrl-C");
+            tracing::info!("Warden shutdown requested via Ctrl-C");
         }
         _ = signal.recv() => {
-            println!("Warden shutdown requested via SIGTERM");
+            tracing::info!("Warden shutdown requested via SIGTERM");
         }
     }
 
-    println!("Warden daemon stopped.");
+    tracing::info!("Warden daemon stopped.");
     // Remove PID file on clean exit (P1-9)
     let _ = std::fs::remove_file(pid_file_path);
     // Cleanup low-level telemetry resources

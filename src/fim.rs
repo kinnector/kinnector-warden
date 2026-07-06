@@ -91,6 +91,9 @@ pub fn start_fim_watcher(web_root: String, config_dirs: Vec<PathBuf>) {
         loop {
             tokio::select! {
                 Some(event) = rx.recv() => {
+                    if crate::allowlist::get_disabled_web_roots().contains(&web_root) {
+                        continue;
+                    }
                     let is_modify = matches!(event.kind, EventKind::Modify(_));
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {

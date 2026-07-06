@@ -32,9 +32,9 @@ pub fn start_api_server(
             }
         };
 
-        // Make socket accessible to wordpress (www-data) and warden-cli (users)
+        // Make socket accessible to root and members of the socket group (0660)
         let _ = std::process::Command::new("chmod")
-            .args(["0666", socket_path])
+            .args(["0660", socket_path])
             .output();
 
         println!("[Warden API] Listening on UDS socket: {}", socket_path);
@@ -44,10 +44,21 @@ pub fn start_api_server(
         loop {
             match listener.accept().await {
                 Ok((mut stream, _)) => {
+                    // S-1 Fix: Verify peer UID is 0 (root) to prevent unprivileged access
+                    if let Ok(cred) = stream.peer_cred() {
+                        if cred.uid() != 0 {
+                            eprintln!("[Warden API] Rejecting connection from non-root process (UID: {})", cred.uid());
+                            continue;
+                        }
+                    } else {
+                        eprintln!("[Warden API] Rejecting connection: unable to determine peer credentials");
+                        continue;
+                    }
+
                     let heuristics_clone = Arc::clone(&heuristics);
                     let web_roots_clone = web_roots.clone();
                     tokio::spawn(async move {
-                    let mut buf = Vec::with_capacity(8192);
+                        let mut buf = Vec::with_capacity(8192);
                         let mut tmp = [0u8; 4096];
                         // Read until full HTTP request headers received (\r\n\r\n)
                         loop {
@@ -142,6 +153,7 @@ async fn handle_http_request(
                 "web_roots": web_roots,
                 "listening_services": listening_services,
                 "packages": packages,
+                "tls_forensics": crate::tls_buffer::get_tls_forensics_status(),
             });
             build_json_response(200, &state_json)
         }
@@ -256,6 +268,10 @@ async fn handle_http_request(
             } else {
                 build_error_response(400, "Missing parameters (path or git)")
             }
+        }
+        ("GET", "/api/v1/containers") => {
+            let list = crate::discovery::discover_docker_containers().await;
+            build_json_response(200, &serde_json::to_value(&list).unwrap_or_else(|_| json!([])))
         }
         ("GET", "/api/v1/quarantine") => {
             let entries = crate::quarantine::list_quarantined();

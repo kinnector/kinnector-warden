@@ -1,0 +1,16 @@
+syntax = "proto3";
+package warden;
+
+service WardenService {
+    rpc CommandStream(stream AgentMessage) returns (stream ConsoleMessage);
+}
+
+message AgentMessage {
+    string agent_id = 1;
+    string license_key = 2;
+    string payload_json = 3;
+}
+
+message ConsoleMessage {
+    string command_json = 1;
+}

@@ -256,18 +256,50 @@ fn parse_package_lock(content: &str, deps: &mut Vec<DetectedDependency>, path: &
 fn parse_requirements(content: &str, deps: &mut Vec<DetectedDependency>, path: &str) {
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
             continue;
         }
-        let parts: Vec<&str> = trimmed.split("==").collect();
-        if parts.len() == 2 {
-            deps.push(DetectedDependency {
-                name: parts[0].trim().to_lowercase(),
-                version: parts[1].trim().to_string(),
-                is_dev: false, // requirements.txt typically has no dev metadata
-                ecosystem_key: "pip".to_string(),
-                lock_file_path: path.to_string(),
-            });
+
+        let operators = ["==", ">=", "<=", "~=", "!=", "===", ">", "<", "@", ";"];
+        let mut split_idx = trimmed.len();
+        let mut found_operator = "";
+
+        for op in &operators {
+            if let Some(idx) = trimmed.find(op) {
+                if idx < split_idx {
+                    split_idx = idx;
+                    found_operator = op;
+                }
+            }
+        }
+
+        let raw_name = &trimmed[..split_idx];
+        let clean_name = if let Some(bracket_idx) = raw_name.find('[') {
+            &raw_name[..bracket_idx]
+        } else {
+            raw_name
+        }.trim();
+
+        if clean_name.is_empty() {
+            continue;
+        }
+
+        if !found_operator.is_empty() && found_operator != ";" {
+            let version_part = trimmed[split_idx + found_operator.len()..].trim();
+            let end_idx = version_part.find(|c| c == ';' || c == ',' || c == ' ' || c == '#')
+                .unwrap_or(version_part.len());
+            let raw_version = version_part[..end_idx].trim();
+            let clean_version = raw_version.trim_start_matches(|c| c == '=' || c == '>' || c == '<' || c == '!' || c == '~');
+
+            if !clean_version.is_empty() {
+                deps.push(DetectedDependency {
+                    name: clean_name.to_lowercase(),
+                    version: clean_version.to_string(),
+                    is_dev: false,
+                    ecosystem_key: "pip".to_string(),
+                    lock_file_path: path.to_string(),
+                });
+            }
         }
     }
 }
@@ -381,6 +413,12 @@ fn parse_poetry_lock(content: &str, deps: &mut Vec<DetectedDependency>, path: &s
                 if c == "dev" {
                     is_dev = true;
                 }
+            }
+        } else if trimmed.starts_with("groups =") {
+            let contains_dev = trimmed.contains("\"dev\"");
+            let contains_main = trimmed.contains("\"main\"");
+            if contains_dev && !contains_main {
+                is_dev = true;
             }
         }
     }

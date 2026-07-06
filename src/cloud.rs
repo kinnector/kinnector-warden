@@ -7,6 +7,16 @@ use crate::heuristics::HeuristicsEngine;
 
 static CLOUD_CLIENT: OnceLock<CloudClient> = OnceLock::new();
 static LOGS_BUFFER: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+pub fn get_http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
 
 struct CloudClient {
     pub cloud_endpoint: Option<String>,
@@ -105,7 +115,7 @@ pub async fn sync_rules_now(config: &Arc<kinnector_config::ConfigManager>) -> bo
     };
 
     println!("[Warden Cloud] License validated. Initiating remote rule updates sync from {}", client_info.updates_server);
-    let http_client = reqwest::Client::new();
+    let http_client = get_http_client().clone();
     let req = http_client.get(&client_info.updates_server)
         .header("X-License-Key", license)
         .header("X-Agent-Version", env!("CARGO_PKG_VERSION"));
@@ -149,7 +159,7 @@ pub async fn send_forensic_payload(alert_id: &str, payload: Vec<u8>) -> bool {
     let Some(endpoint) = &client.cloud_endpoint else { return false; };
 
     let url = format!("{}/api/v1/forensics/{}", endpoint, alert_id);
-    let http_client = reqwest::Client::new();
+    let http_client = get_http_client().clone();
     let mut req = http_client.post(&url)
         .body(payload)
         .header("Content-Type", "application/octet-stream")
@@ -197,7 +207,7 @@ fn start_log_streamer(client: &'static CloudClient) {
     let _ = STARTUP_TIME.get_or_init(std::time::Instant::now);
 
     tokio::spawn(async move {
-        let http_client = reqwest::Client::new();
+        let http_client = get_http_client().clone();
         loop {
             sleep(Duration::from_secs(60)).await;
 
@@ -296,6 +306,25 @@ fn start_forensic_uploader(client: &'static CloudClient) {
     });
 }
 
+pub mod proto {
+    tonic::include_proto!("warden");
+}
+
+use proto::warden_service_client::WardenServiceClient;
+use proto::AgentMessage;
+
+struct MyStream(tokio::sync::mpsc::Receiver<AgentMessage>);
+
+impl futures_core::Stream for MyStream {
+    type Item = AgentMessage;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
 fn start_command_listener(heuristics: Arc<HeuristicsEngine>, client: &'static CloudClient) {
     let endpoint = match &client.cloud_endpoint {
         Some(ep) => ep.clone(),
@@ -303,28 +332,73 @@ fn start_command_listener(heuristics: Arc<HeuristicsEngine>, client: &'static Cl
     };
 
     tokio::spawn(async move {
-        let http_client = reqwest::Client::new();
         loop {
-            let url = format!("{}/api/v1/agent/commands", endpoint);
-            let mut req = http_client.get(&url)
-                .header("Connection", "keep-alive");
-            if let Some(key) = &client.license_key {
-                req = req.header("X-License-Key", key);
-            }
+            let url = if endpoint.contains("/api/v1") {
+                if let Some(pos) = endpoint.find("/api/v1") {
+                    endpoint[..pos].to_string()
+                } else {
+                    endpoint.clone()
+                }
+            } else {
+                endpoint.clone()
+            };
 
-            match req.send().await {
-                Ok(res) => {
-                    if res.status().is_success() {
-                        if let Ok(cmd_json) = res.json::<serde_json::Value>().await {
-                            process_cloud_command(cmd_json, Arc::clone(&heuristics)).await;
+            tracing::info!("[Warden Cloud] Attempting gRPC connection to console: {}", url);
+            match tonic::transport::Endpoint::from_shared(url) {
+                Ok(endpoint_conf) => {
+                    let endpoint_conf = endpoint_conf
+                        .keep_alive_while_idle(true)
+                        .connect_timeout(Duration::from_secs(10));
+                    
+                    match endpoint_conf.connect().await {
+                        Ok(channel) => {
+                            tracing::info!("[Warden Cloud] gRPC connected to console.");
+                            let mut grpc_client = WardenServiceClient::new(channel);
+
+                            let (tx, rx) = tokio::sync::mpsc::channel(100);
+                            
+                            let agent_id = uuid::Uuid::new_v4().to_string();
+                            let license_key = client.license_key.clone().unwrap_or_default();
+                            let reg_payload = serde_json::json!({
+                                "event": "register",
+                                "agent_version": env!("CARGO_PKG_VERSION"),
+                            }).to_string();
+
+                            let _ = tx.send(AgentMessage {
+                                agent_id: agent_id.clone(),
+                                license_key: license_key.clone(),
+                                payload_json: reg_payload,
+                            }).await;
+
+                            let outbound_stream = MyStream(rx);
+                            
+                            match grpc_client.command_stream(outbound_stream).await {
+                                Ok(response) => {
+                                    let mut inbound_stream = response.into_inner();
+                                    
+                                    while let Ok(Some(msg)) = inbound_stream.message().await {
+                                        if let Ok(cmd_json) = serde_json::from_str::<serde_json::Value>(&msg.command_json) {
+                                            process_cloud_command(cmd_json, Arc::clone(&heuristics)).await;
+                                        }
+                                    }
+                                    tracing::warn!("[Warden Cloud] gRPC stream closed by remote console.");
+                                }
+                                Err(e) => {
+                                    tracing::error!("[Warden Cloud] Failed to establish gRPC stream: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("[Warden Cloud] gRPC connection failed: {}", e);
                         }
                     }
                 }
-                Err(_) => {
-                    sleep(Duration::from_secs(10)).await;
+                Err(e) => {
+                    tracing::error!("[Warden Cloud] Invalid gRPC URL: {}", e);
                 }
             }
-            sleep(Duration::from_secs(5)).await;
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
     });
 }
@@ -333,6 +407,36 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: Arc<Heuristic
     let Some(action) = cmd.get("action").and_then(|a| a.as_str()) else { return; };
     println!("[Warden Cloud] Received remote control command: {}", action);
     match action {
+        "disable_monitoring" => {
+            if let Some(pid) = cmd.get("pid").and_then(|p| p.as_u64()) {
+                println!("[Warden Cloud] Remote command: Disabling monitoring for PID {}", pid);
+                crate::allowlist::get_disabled_monitoring_pids().insert(pid as u32);
+            } else if let Some(path) = cmd.get("web_root").and_then(|p| p.as_str()) {
+                println!("[Warden Cloud] Remote command: Disabling FIM/monitoring for web root {}", path);
+                crate::allowlist::get_disabled_web_roots().insert(path.to_string());
+            }
+        }
+        "enable_monitoring" => {
+            if let Some(pid) = cmd.get("pid").and_then(|p| p.as_u64()) {
+                println!("[Warden Cloud] Remote command: Re-enabling monitoring for PID {}", pid);
+                crate::allowlist::get_disabled_monitoring_pids().remove(&(pid as u32));
+            } else if let Some(path) = cmd.get("web_root").and_then(|p| p.as_str()) {
+                println!("[Warden Cloud] Remote command: Re-enabling FIM/monitoring for web root {}", path);
+                crate::allowlist::get_disabled_web_roots().remove(path);
+            }
+        }
+        "disable_tls" => {
+            if let Some(pid) = cmd.get("pid").and_then(|p| p.as_u64()) {
+                println!("[Warden Cloud] Remote command: Disabling TLS telemetry decryption/storage for PID {}", pid);
+                crate::allowlist::get_disabled_tls_pids().insert(pid as u32);
+            }
+        }
+        "enable_tls" => {
+            if let Some(pid) = cmd.get("pid").and_then(|p| p.as_u64()) {
+                println!("[Warden Cloud] Remote command: Re-enabling TLS telemetry decryption/storage for PID {}", pid);
+                crate::allowlist::get_disabled_tls_pids().remove(&(pid as u32));
+            }
+        }
         "kill_process" => {
             if let Some(pid) = cmd.get("pid").and_then(|p| p.as_u64()) {
                 println!("[Warden Cloud] Remote command: Killing process ID {}", pid);
@@ -363,10 +467,11 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: Arc<Heuristic
         "block_ip" => {
             if let Some(ip) = cmd.get("ip").and_then(|i| i.as_str()) {
                 println!("[Warden Cloud] Remote command: Blocking IP {}", ip);
-                if std::net::IpAddr::from_str(ip).is_ok() {
+                if let Ok(ip_addr) = std::net::IpAddr::from_str(ip) {
                     let ip_owned = ip.to_string();
+                    let binary = if ip_addr.is_ipv6() { "ip6tables" } else { "iptables" };
                     tokio::spawn(async move {
-                        let _ = tokio::process::Command::new("iptables")
+                        let _ = tokio::process::Command::new(binary)
                             .args(["-A", "INPUT", "-s", &ip_owned, "-j", "DROP"])
                             .output().await;
                     });
@@ -376,10 +481,11 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: Arc<Heuristic
         "unblock_ip" => {
             if let Some(ip) = cmd.get("ip").and_then(|i| i.as_str()) {
                 println!("[Warden Cloud] Remote command: Unblocking IP {}", ip);
-                if std::net::IpAddr::from_str(ip).is_ok() {
+                if let Ok(ip_addr) = std::net::IpAddr::from_str(ip) {
                     let ip_owned = ip.to_string();
+                    let binary = if ip_addr.is_ipv6() { "ip6tables" } else { "iptables" };
                     tokio::spawn(async move {
-                        let _ = tokio::process::Command::new("iptables")
+                        let _ = tokio::process::Command::new(binary)
                             .args(["-D", "INPUT", "-s", &ip_owned, "-j", "DROP"])
                             .output().await;
                     });
@@ -493,10 +599,11 @@ pub async fn send_inventory_sync(heuristics: &HeuristicsEngine) {
         "listening_services": listening_services,
         "containers": containers,
         "packages": packages,
+        "tls_forensics": crate::tls_buffer::get_tls_forensics_status(),
     });
 
     let url = format!("{}/api/v1/agent/inventory", endpoint);
-    let http_client = reqwest::Client::new();
+    let http_client = get_http_client().clone();
     let mut req = http_client.post(&url)
         .json(&payload);
     if let Some(key) = &client.license_key {
@@ -532,7 +639,7 @@ pub fn send_alert_immediate(payload: &crate::notifications::AlertPayload) {
     let url = format!("{}/api/v1/alerts/stream", endpoint);
     let payload = payload.clone();
     tokio::spawn(async move {
-        let http_client = reqwest::Client::new();
+        let http_client = get_http_client().clone();
         let mut req = http_client.post(&url)
             .json(&payload);
         if let Some(key) = &get_client().license_key {

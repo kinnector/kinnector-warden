@@ -43,6 +43,22 @@ static ALLOWED_INODES: OnceLock<Arc<DashSet<u64>>> = OnceLock::new();
 /// (false).  Walk-seeded mode is inherently less strict.
 static GIT_SEEDED: OnceLock<bool> = OnceLock::new();
 
+static DISABLED_MONITORING_PIDS: OnceLock<Arc<DashSet<u32>>> = OnceLock::new();
+static DISABLED_TLS_PIDS: OnceLock<Arc<DashSet<u32>>> = OnceLock::new();
+static DISABLED_WEB_ROOTS: OnceLock<Arc<DashSet<String>>> = OnceLock::new();
+
+pub fn get_disabled_monitoring_pids() -> Arc<DashSet<u32>> {
+    DISABLED_MONITORING_PIDS.get_or_init(|| Arc::new(DashSet::new())).clone()
+}
+
+pub fn get_disabled_tls_pids() -> Arc<DashSet<u32>> {
+    DISABLED_TLS_PIDS.get_or_init(|| Arc::new(DashSet::new())).clone()
+}
+
+pub fn get_disabled_web_roots() -> Arc<DashSet<String>> {
+    DISABLED_WEB_ROOTS.get_or_init(|| Arc::new(DashSet::new())).clone()
+}
+
 // ---------------------------------------------------------------------------
 // Seeding
 // ---------------------------------------------------------------------------

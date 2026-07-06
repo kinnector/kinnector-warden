@@ -6,7 +6,7 @@ use std::str::FromStr;
 use crate::types::{
     TelemetryEventRaw, EventType, ProcessCreateDetails, NetworkConnectDetails,
     SSHAuthDetails, TerminalCommandDetails, FileOpenDetails, MemoryMapDetails, Dup2Details,
-    FileWriteDetails, FileRenameDetails, MemoryProtectDetails,
+    FileWriteDetails, FileRenameDetails, MemoryProtectDetails, PtraceAttachDetails,
 };
 
 // PROT_EXEC flag for mmap/mprotect detection
@@ -63,6 +63,10 @@ impl HeuristicsEngine {
     pub fn handle_raw_event(&self, raw: TelemetryEventRaw) {
         let header = raw.header;
         let event_pid = header.pid;
+
+        if crate::allowlist::get_disabled_monitoring_pids().contains(&event_pid) {
+            return;
+        }
 
         match header.event_type {
             // ---------------------------------------------------------------
@@ -754,6 +758,51 @@ impl HeuristicsEngine {
                 }
             }
 
+            // ---------------------------------------------------------------
+            // PtraceAttach — I-5: debugger attach from a web process
+            //
+            // ptrace(PTRACE_ATTACH) or ptrace(PTRACE_SEIZE) issued by a web
+            // process is a strong post-exploitation signal.  An attacker who
+            // already has code execution inside a web worker may try to pivot
+            // into another process (e.g. a privileged side-car) by attaching a
+            // debugger.  We SIGKILL the attaching process and emit a HIGH alert.
+            // ---------------------------------------------------------------
+            EventType::PtraceAttach => {
+                let details: PtraceAttachDetails = unsafe {
+                    std::ptr::read(raw.details_buffer.as_ptr() as *const PtraceAttachDetails)
+                };
+                let mode = null_terminated_str(&details.mode);
+                // Copy packed field to local to avoid UB reference to unaligned field
+                let target_pid: u32 = details.target_pid;
+
+                // Only act if the attaching process is a tracked web-context process.
+                let is_web = self.process_map
+                    .get(&event_pid)
+                    .map(|p| p.is_web_server)
+                    .unwrap_or_else(|| self.listening_pids.contains(&event_pid));
+
+                if is_web {
+                    let (exe, cmd, ppid) = self.process_map.get(&event_pid)
+                        .map(|p| (p.exe.clone(), p.cmdline.clone(), p.ppid))
+                        .unwrap_or_else(|| {
+                            let exe = std::fs::read_link(format!("/proc/{}/exe", event_pid))
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            (exe, String::new(), 0u32)
+                        });
+
+                    self.terminate_threat_child(
+                        event_pid, &exe, &cmd, "", ppid,
+                        "Threat.Server.DebuggerAttach",
+                        &format!(
+                            "Web process attached a debugger (ptrace mode: {}) to target PID {}. \
+                             Possible post-exploitation process pivot. Attaching process terminated.",
+                            mode, target_pid
+                        ),
+                    );
+                }
+            }
+
             _ => {}
         }
     }
@@ -917,19 +966,23 @@ fn log_and_dispatch(payload: crate::notifications::AlertPayload) {
 /// B-05 fix: Use explicit iptables args (no `sh -c`); validate IP address first.
 fn trigger_firewall_block(ip: &str) {
     // Validate IP before passing to iptables to prevent injection
-    if IpAddr::from_str(ip).is_err() {
-        eprintln!("[Warden Heuristics] Refusing to block invalid IP address: {:?}", ip);
-        return;
-    }
+    let ip_addr = match IpAddr::from_str(ip) {
+        Ok(addr) => addr,
+        Err(_) => {
+            eprintln!("[Warden Heuristics] Refusing to block invalid IP address: {:?}", ip);
+            return;
+        }
+    };
     let ip_owned = ip.to_string();
+    let binary = if ip_addr.is_ipv6() { "ip6tables" } else { "iptables" };
     tokio::spawn(async move {
         // Block: explicit args only, no shell interpretation
-        let _ = tokio::process::Command::new("iptables")
+        let _ = tokio::process::Command::new(binary)
             .args(["-A", "INPUT", "-s", &ip_owned, "-j", "DROP"])
             .output().await;
         tokio::time::sleep(tokio::time::Duration::from_secs(2 * 3600)).await;
         // Unblock after 2 hours
-        let _ = tokio::process::Command::new("iptables")
+        let _ = tokio::process::Command::new(binary)
             .args(["-D", "INPUT", "-s", &ip_owned, "-j", "DROP"])
             .output().await;
     });

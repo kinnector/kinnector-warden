@@ -1,0 +1,64 @@
+# Kinnector Warden - Core Configuration File Template
+# Default Path: /etc/kinnector/core.conf
+
+# ==============================================================================
+# 🔑 License & Identity
+# ==============================================================================
+
+# license_key: Sets the license tier for this node.
+# - "free": Local auditing & rule enforcement only. Forensic TLS buffers captured
+#           in-memory are not flusheed to logs (requires paid tier).
+# - "<key>": Commercial license key for cloud fleet sync and transparent forensic decryption.
+license_key=free
+
+# auth_token: Secret token for validating communication between warden-cli and daemon.
+# Should be generated randomly during installation.
+auth_token=
+
+# ==============================================================================
+# 📂 Paths & Processes
+# ==============================================================================
+
+# pid_file: Path to write the daemon's PID file.
+pid_file=/var/run/kinnector/wardend.pid
+
+# quarantine_dir: Directory where quarantined/isolated files are moved.
+quarantine_dir=/var/quarantine/kinnector
+
+# ==============================================================================
+# 🔍 Vulnerability & OSV Scanner
+# ==============================================================================
+
+# scan_interval_hours: Interval in hours between automated dependency scans.
+scan_interval_hours=12
+
+# osv_db_path: Path to the local offline OSV vulnerability database file.
+# The database can be synced from https://osv.dev or custom mirrors.
+osv_db_path=/etc/kinnector/osv.json
+
+# ==============================================================================
+# ☁️ Fleet Management & Cloud Sync
+# ==============================================================================
+
+# cloud_endpoint: URL to the Kinnector Fleet Console API. If left empty, Warden
+# operates in standalone local-only mode.
+# cloud_endpoint=https://console.kinnector.com/api/v1/agent
+
+# updates_server: HTTP/HTTPS server for pulling signed rule updates.
+updates_server=https://updates.kinnector.com/rules.db
+
+# ==============================================================================
+# 🔒 TLS Forensic Buffer Settings (Paid Tier)
+# ==============================================================================
+
+# tls_buffer.capacity_mb: Size in megabytes of the per-process ring buffer.
+tls_buffer.capacity_mb=32
+
+# tls_buffer.global_capacity_mb: Maximum memory capacity limit for all buffers.
+tls_buffer.global_capacity_mb=256
+
+# tls_buffer.redact_headers: Comma-separated list of HTTP headers to mask/zero-out.
+tls_buffer.redact_headers=Authorization,Cookie,Set-Cookie
+
+# tls_buffer.exclude_paths: Comma-separated regexes of URL paths to exclude from dump capture.
+# tls_buffer.exclude_paths=.*/healthcheck,.*\.png,.*\.jpg

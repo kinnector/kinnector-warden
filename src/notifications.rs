@@ -105,7 +105,18 @@ pub fn dispatch_alert(payload: AlertPayload) {
 
     tokio::spawn(async move {
         // Dedup: skip if same (threat_type, pid) fired within 5 min
-        let dedup_key = format!("{}:{}", payload.threat_type, payload.process.pid);
+        let mut dedup_key = format!("{}:{}", payload.threat_type, payload.process.pid);
+        if payload.threat_type.starts_with("Event.Server.SSHAuth") {
+            use std::str::FromStr;
+            let ip = payload.remediation.status.split_whitespace()
+                .find(|word| {
+                    let cleaned = word.trim_matches(|c| c == ',' || c == '.' || c == ':' || c == '\'' || c == '"');
+                    std::net::IpAddr::from_str(cleaned).is_ok()
+                })
+                .map(|word| word.trim_matches(|c| c == ',' || c == '.' || c == ':' || c == '\'' || c == '"'))
+                .unwrap_or("");
+            dedup_key = format!("{}:{}:{}", payload.threat_type, payload.process.pid, ip);
+        }
         let now = chrono::Utc::now().timestamp();
         let dedup = DISPATCH_DEDUP.get_or_init(|| Arc::new(DashMap::new()));
         if let Some(last) = dedup.get(&dedup_key) {
@@ -128,7 +139,7 @@ pub fn dispatch_alert(payload: AlertPayload) {
                 return;
             }
         };
-        let client = reqwest::Client::new();
+        let client = crate::cloud::get_http_client().clone();
 
         // 1. Slack dispatch
         if let Some(slack) = config.notifications.slack {
