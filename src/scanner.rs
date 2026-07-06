@@ -29,15 +29,14 @@ struct DetectedDependency {
     pub lock_file_path: String,
 }
 
-pub fn start_scanner(root_dir: String) {
+pub fn start_scanner(root_dir: String, interval_hours: u64) {
     tokio::spawn(async move {
         loop {
             println!("[Warden Scanner] Starting dependency vulnerability check on: {}", root_dir);
             if let Err(e) = run_scan(&root_dir).await {
                 eprintln!("[Warden Scanner] Scan failed: {}", e);
             }
-            // Sleep for 12 hours
-            tokio::time::sleep(tokio::time::Duration::from_secs(12 * 3600)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval_hours * 3600)).await;
         }
     });
 }

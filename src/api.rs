@@ -47,29 +47,32 @@ pub fn start_api_server(
                     let heuristics_clone = Arc::clone(&heuristics);
                     let web_roots_clone = web_roots.clone();
                     tokio::spawn(async move {
-                        let mut buffer = [0u8; 4096];
-                        let mut bytes_read = 0;
-                        
-                        // Read request
+                    let mut buf = Vec::with_capacity(8192);
+                        let mut tmp = [0u8; 4096];
+                        // Read until full HTTP request headers received (\r\n\r\n)
                         loop {
-                            match stream.read(&mut buffer[bytes_read..]).await {
+                            match stream.read(&mut tmp).await {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    bytes_read += n;
-                                    // Check if we reached end of headers
-                                    if String::from_utf8_lossy(&buffer[..bytes_read]).contains("\r\n\r\n") {
+                                    buf.extend_from_slice(&tmp[..n]);
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
                                         break;
+                                    }
+                                    // Safety cap: 1 MB max request size
+                                    if buf.len() > 1_048_576 {
+                                        return;
                                     }
                                 }
                                 Err(_) => return,
                             }
                         }
+                        let bytes_read = buf.len();
 
                         if bytes_read == 0 {
                             return;
                         }
 
-                        let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
+                        let request_str = String::from_utf8_lossy(&buf);
                         let response = handle_http_request(
                             &request_str,
                             heuristics_clone,
@@ -115,13 +118,30 @@ async fn handle_http_request(
             let is_lsm = unsafe { crate::ffi::is_lsm_active() };
             let uptime = startup_time.elapsed().as_secs();
             let is_paid = crate::tls_buffer::is_paid_tier();
+            let in_container = std::path::Path::new("/.dockerenv").exists();
+            // Snapshot of currently listening services (non-blocking, reads from /proc)
+            let listening_services = crate::discovery::get_listening_services();
+            // Snapshot of installed packages from known web root lockfiles
+            let packages: Vec<serde_json::Value> = web_roots.iter()
+                .flat_map(|r| crate::scanner::get_installed_packages(r))
+                .map(|pkg| serde_json::json!({
+                    "name": pkg.name,
+                    "version": pkg.version,
+                    "ecosystem": pkg.ecosystem,
+                    "lock_file": pkg.lock_file,
+                    "is_dev": pkg.is_dev,
+                }))
+                .collect();
             let state_json = json!({
                 "status": if is_paid { "licensed" } else { "active" },
                 "tier": if is_paid { "paid" } else { "free" },
                 "version": "0.1.0",
                 "lsm_active": is_lsm,
+                "in_container": in_container,
                 "uptime_secs": uptime,
                 "web_roots": web_roots,
+                "listening_services": listening_services,
+                "packages": packages,
             });
             build_json_response(200, &state_json)
         }

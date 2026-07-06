@@ -73,6 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|l| l.trim_start_matches("pid_file=").trim().to_string())
         .unwrap_or_else(|| "/var/run/kinnector/wardend.pid".to_string());
 
+    let scan_interval_hours: u64 = core_conf.lines()
+        .find(|l| l.starts_with("scan_interval_hours="))
+        .and_then(|l| l.trim_start_matches("scan_interval_hours=").trim().parse().ok())
+        .unwrap_or(12);
+
     // Write PID file
     if let Some(parent) = std::path::Path::new(&pid_file_path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -195,6 +200,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         system_shells,
     ));
 
+    // 5b. Seed process_map with pre-existing processes from /proc at startup
+    //     This ensures processes that were already running before the daemon started
+    //     are tracked with their full cmdline and binary path.
+    if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+        for entry in proc_dir.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Ok(pid) = name_str.parse::<u32>() else { continue; };
+            let exe_path = format!("/proc/{}/exe", pid);
+            let cmdline_path = format!("/proc/{}/cmdline", pid);
+            let exe = std::fs::read_link(&exe_path)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let cmdline = std::fs::read_to_string(&cmdline_path)
+                .map(|s| s.replace('\0', " ").trim().to_string())
+                .unwrap_or_default();
+            if !exe.is_empty() {
+                let is_web = heuristics.config.is_web_process(&exe)
+                    || heuristics.listening_pids.contains(&pid);
+                if is_web {
+                    heuristics.process_map.insert(pid, crate::heuristics::ProcessNode {
+                        pid,
+                        ppid: 1,
+                        exe: exe.clone(),
+                        cmdline,
+                        is_web_server: is_web,
+                        is_install_context: false,
+                        is_top_level_install: false,
+                        install_root_pid: 0,
+                        depth: 0,
+                    });
+                    println!("[Warden Startup] Pre-seeded process map: PID {} ({})", pid, exe);
+                }
+            }
+        }
+    }
+
     // P4-5 & P4-6: Add system persistence and SSL/TLS directories to FIM watch list
     let extra_fim_paths = [
         "/etc/cron.d",
@@ -225,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8. Start Dependency Vulnerabilities OSV Scanner
     for root in &web_roots {
-        crate::scanner::start_scanner(root.clone());
+        crate::scanner::start_scanner(root.clone(), scan_interval_hours);
     }
 
     // 8b. Start SSH brute-force monitor (auth log tailer — Phase 3)
