@@ -357,6 +357,13 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEn
             println!("[Warden Cloud] Remote command: Reloading local rule database");
             let _ = heuristics.config.reload();
         }
+        "sync_rules" | "rules_sync" => {
+            println!("[Warden Cloud] Remote command: Triggering immediate remote rules sync");
+            let config_clone = Arc::clone(&heuristics.config);
+            tokio::spawn(async move {
+                let _ = sync_rules_now(&config_clone).await;
+            });
+        }
         "fim_add" => {
             if let Some(path) = cmd.get("path").and_then(|p| p.as_str()) {
                 println!("[Warden Cloud] Remote command: Adding FIM watch path {}", path);
