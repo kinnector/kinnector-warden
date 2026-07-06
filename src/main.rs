@@ -28,9 +28,6 @@ struct Args {
 
     #[arg(short, long, default_value = "/var/www/html", help = "Web application root directory for FIM and OSV scans")]
     web_root: String,
-
-    #[arg(long, default_value = "/etc/kinnector/rules.json", help = "Path to rules database configuration")]
-    config: String,
 }
 
 #[tokio::main]
