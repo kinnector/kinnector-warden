@@ -274,13 +274,20 @@ impl HeuristicsEngine {
                             } else {
                                 "startup-walk-indexed"
                             };
-                            self.emit_threat(
+                            let alert_id = uuid::Uuid::new_v4().to_string();
+                            let reason = format!(
+                                "Web process read a file not present in the {} allowlist: {}",
+                                mode, path
+                            );
+                            
+                            // Quarantine the file (Heuristic S-B Containment Action)
+                            let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason);
+
+                            self.emit_threat_with_id(
+                                alert_id,
                                 event_pid, &exe, &cmd, "", ppid,
                                 "Threat.Server.UnregisteredFileRead",
-                                &format!(
-                                    "Web process read a file not present in the {} allowlist: {}",
-                                    mode, path
-                                ),
+                                &reason
                             );
                         }
                     }
@@ -331,12 +338,21 @@ impl HeuristicsEngine {
                             let exe = proc.exe.clone();
                             let cmd = proc.cmdline.clone();
                             let ppid = proc.ppid;
+                            let depth = proc.depth;
                             drop(proc);
-                            self.emit_threat(
-                                event_pid, &exe, &cmd, "", ppid,
-                                "Threat.Server.MemoryShellcode",
-                                "Web process created anonymous executable memory mapping — likely in-memory shellcode."
-                            );
+                            if depth > 0 {
+                                self.terminate_threat_child(
+                                    event_pid, &exe, &cmd, "", ppid,
+                                    "Threat.Server.MemoryShellcode",
+                                    "Web process created anonymous executable memory mapping — likely in-memory shellcode. Terminated child process."
+                                );
+                            } else {
+                                self.emit_threat(
+                                    event_pid, &exe, &cmd, "", ppid,
+                                    "Threat.Server.MemoryShellcode",
+                                    "Web process created anonymous executable memory mapping — likely in-memory shellcode."
+                                );
+                            }
                         }
                     }
                 }
@@ -361,10 +377,10 @@ impl HeuristicsEngine {
                             let cmd = proc.cmdline.clone();
                             let ppid = proc.ppid;
                             drop(proc);
-                            self.emit_threat(
+                            self.terminate_threat_child(
                                 event_pid, &exe, &cmd, "", ppid,
                                 "Threat.Server.ReverseShell",
-                                "Web process duplicated socket fd to stdin/stdout — classic reverse shell pattern."
+                                "Web process duplicated socket fd to stdin/stdout — classic reverse shell pattern. Terminated process tree."
                             );
                         }
                     }
@@ -436,12 +452,22 @@ impl HeuristicsEngine {
                     } else {
                         "startup-walk-indexed"
                     };
-                    self.emit_threat(
+                    let alert_id = uuid::Uuid::new_v4().to_string();
+                    let reason = format!(
+                        "Web process wrote a file not present in the {} allowlist: {}",
+                        mode, path
+                    );
+
+                    // Quarantine the file (Heuristic S-B / S-H Containment Action)
+                    let _ = crate::quarantine::quarantine_file(&path, &alert_id, &reason);
+
+                    self.emit_threat_with_id(
+                        alert_id,
                         event_pid, &exe, &cmd, "", ppid,
                         "Threat.Server.UnregisteredFileWrite",
                         &format!(
                             "Web process wrote a file not present in the {} allowlist: {}. \
-                             Possible unrestricted upload / RFI staging / webshell drop.",
+                             Possible unrestricted upload / RFI staging / webshell drop. File isolated in quarantine.",
                             mode, path
                         ),
                     );
@@ -564,7 +590,8 @@ impl HeuristicsEngine {
                 let ip = null_terminated_str(&details.source_ip);
                 let status = null_terminated_str(&details.status);
 
-                if status.to_lowercase() == "failure" {
+                let status_lower = status.to_lowercase();
+                if status_lower == "failure" {
                     let now = Utc::now().timestamp();
                     let mut attempts = self.ssh_attempts.entry(ip.clone()).or_insert_with(Vec::new);
                     attempts.push(now);
@@ -596,6 +623,27 @@ impl HeuristicsEngine {
                         log_and_dispatch(payload);
                         trigger_firewall_block(&ip);
                     }
+                } else if status_lower == "success" {
+                    let alert_id = format!("ssh-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                    let payload = crate::notifications::AlertPayload {
+                        alert_id,
+                        timestamp: Utc::now().to_rfc3339(),
+                        threat_type: "Event.Server.SSHAuth".to_string(),
+                        severity: "INFO".to_string(),
+                        container: None,
+                        process: crate::notifications::ProcessInfo {
+                            pid: 0,
+                            exec_path: "/usr/sbin/sshd".to_string(),
+                            cmdline: format!("User: {}", username),
+                            parent_exec_path: "systemd".to_string(),
+                            parent_pid: 1,
+                        },
+                        remediation: crate::notifications::RemediationInfo {
+                            action: "LOG_ALERT".to_string(),
+                            status: format!("Successful SSH login for user {} from IP {}", username, ip),
+                        },
+                    };
+                    log_and_dispatch(payload);
                 }
             }
 
@@ -676,6 +724,25 @@ impl HeuristicsEngine {
         desc: &str,
     ) {
         let alert_id = uuid::Uuid::new_v4().to_string();
+        self.emit_threat_with_id(
+            alert_id,
+            pid, exe, cmdline,
+            parent_exe, parent_pid,
+            threat_type, desc
+        );
+    }
+
+    fn emit_threat_with_id(
+        &self,
+        alert_id: String,
+        pid: u32, exe: &str, cmdline: &str,
+        parent_exe: &str, parent_pid: u32,
+        threat_type: &str,
+        desc: &str,
+    ) {
+        // Trigger Forensic TLS Buffer flush (Paid tier)
+        crate::tls_buffer::flush_on_alert(pid, &alert_id);
+
         let payload = crate::notifications::AlertPayload {
             alert_id,
             timestamp: Utc::now().to_rfc3339(),
@@ -710,6 +777,10 @@ impl HeuristicsEngine {
         unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
 
         let alert_id = uuid::Uuid::new_v4().to_string();
+
+        // Trigger Forensic TLS Buffer flush (Paid tier)
+        crate::tls_buffer::flush_on_alert(child_pid, &alert_id);
+
         let payload = crate::notifications::AlertPayload {
             alert_id,
             timestamp: Utc::now().to_rfc3339(),
@@ -739,6 +810,13 @@ impl HeuristicsEngine {
         action: &str, desc: &str,
     ) {
         let alert_id = uuid::Uuid::new_v4().to_string();
+
+        // Trigger Forensic TLS Buffer flush on HIGH or CRITICAL alert (Paid tier)
+        let sev_upper = severity.to_uppercase();
+        if sev_upper == "HIGH" || sev_upper == "CRITICAL" {
+            crate::tls_buffer::flush_on_alert(pid, &alert_id);
+        }
+
         let payload = crate::notifications::AlertPayload {
             alert_id,
             timestamp: Utc::now().to_rfc3339(),

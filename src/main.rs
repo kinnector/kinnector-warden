@@ -16,6 +16,7 @@ mod ssh_monitor;
 mod quarantine;
 mod api;
 mod tty_logger;
+mod tls_buffer;
 
 #[derive(Parser, Debug)]
 #[command(name = "wardend")]
@@ -203,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/etc/bash.bashrc",
         "/etc/ssl",
         "/etc/letsencrypt",
+        "/etc/systemd/system",
     ];
     for path_str in &extra_fim_paths {
         let path = std::path::Path::new(path_str);
@@ -229,6 +231,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8d. Start PTY/TTY logging monitor
     crate::tty_logger::start_tty_logger();
+
+    // 8e. Start Forensic TLS Request Buffer server (Paid Tier)
+    crate::tls_buffer::start_tls_telemetry_server();
 
 
 
