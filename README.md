@@ -1,6 +1,6 @@
-# Kinnector Warden
+# **kinnector** Warden
 
-Warden (`wardend`) is the host and container security daemon for the Kinnector server-side EDR ecosystem. It manages eBPF telemetry hooks, exposes a local Unix socket and HTTP API for vetting web requests, and executes process and network containment mitigations.
+Warden (`wardend`) is the host and container security daemon for the **kinnector** server-side EDR ecosystem. It manages eBPF telemetry hooks, exposes a local Unix socket and HTTP API for vetting web requests, and executes process and network containment mitigations.
 
 ## Local API Interface
 
