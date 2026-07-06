@@ -22,6 +22,7 @@ struct CloudClient {
     pub cloud_endpoint: Option<String>,
     pub updates_server: String,
     pub license_key: Option<String>,
+    pub auto_analyze: bool,
 }
 
 fn get_client() -> &'static CloudClient {
@@ -30,6 +31,7 @@ fn get_client() -> &'static CloudClient {
         let mut cloud_endpoint = None;
         let mut updates_server = "https://updates.kinnector.com/rules.db".to_string();
         let mut license_key = None;
+        let mut auto_analyze = false;
 
         for line in conf.lines() {
             let line = line.trim();
@@ -53,6 +55,9 @@ fn get_client() -> &'static CloudClient {
                             license_key = Some(val.to_string());
                         }
                     }
+                    "auto_analyze" | "auto_analyze_incidents" => {
+                        auto_analyze = val.to_lowercase() == "true" || val == "1";
+                    }
                     _ => {}
                 }
             }
@@ -62,6 +67,7 @@ fn get_client() -> &'static CloudClient {
             cloud_endpoint,
             updates_server,
             license_key,
+            auto_analyze,
         }
     })
 }
@@ -631,6 +637,62 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+fn resolve_incident_file(payload: &crate::notifications::AlertPayload) -> Option<std::path::PathBuf> {
+    // 1. If it's a binary execution threat, the executed binary itself is the target
+    let exec_path = std::path::PathBuf::from(&payload.process.exec_path);
+    
+    // Check if the exec_path itself exists and is a file
+    if exec_path.exists() && exec_path.is_file() {
+        let name_lower = exec_path.to_string_lossy().to_lowercase();
+        // If it's not a standard system interpreter/shell, it could be a compiled payload (ELF) or binary itself
+        let is_system_interpreter = name_lower.contains("/php") || name_lower.contains("/python") ||
+            name_lower.contains("/node") || name_lower.contains("/ruby") ||
+            name_lower.contains("/java") || name_lower.contains("/bash") ||
+            name_lower.contains("/sh") || name_lower.contains("/dash");
+        
+        if !is_system_interpreter {
+            return Some(exec_path);
+        }
+    }
+
+    // 2. If the exec_path is a system interpreter, we parse the command line to find the script/jar file
+    let cmdline = &payload.process.cmdline;
+    let parts: Vec<&str> = cmdline.split_whitespace().collect();
+    for part in parts.iter().skip(1) {
+        if part.starts_with('-') {
+            continue;
+        }
+        let p = std::path::PathBuf::from(part);
+        if p.exists() && p.is_file() {
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+            if ext == "php" || ext == "js" || ext == "py" || ext == "rb" || ext == "jar" || ext == "class" {
+                return Some(p);
+            }
+        }
+    }
+
+    // 3. Fallback: Parse the alert's remediation status/description for any absolute paths
+    let status = &payload.remediation.status;
+    let words: Vec<&str> = status.split_whitespace().collect();
+    for word in words {
+        let cleaned = word.trim_matches(|c| c == ',' || c == '.' || c == '\'' || c == '"' || c == '(' || c == ')');
+        if cleaned.starts_with('/') {
+            let p = std::path::PathBuf::from(cleaned);
+            if p.exists() && p.is_file() {
+                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or_default().to_lowercase();
+                if ext == "php" || ext == "js" || ext == "py" || ext == "rb" || ext == "jar" || ext == "class" || ext == "elf" {
+                    return Some(p);
+                }
+                if cleaned.contains("quarantine") || cleaned.contains("uploads") || cleaned.contains("/tmp") {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub fn send_alert_immediate(payload: &crate::notifications::AlertPayload) {
     let client = get_client();
     let Some(endpoint) = &client.cloud_endpoint else { return; };
@@ -638,13 +700,43 @@ pub fn send_alert_immediate(payload: &crate::notifications::AlertPayload) {
 
     let url = format!("{}/api/v1/alerts/stream", endpoint);
     let payload = payload.clone();
+    let auto_analyze = client.auto_analyze;
+
     tokio::spawn(async move {
         let http_client = get_http_client().clone();
-        let mut req = http_client.post(&url)
-            .json(&payload);
+        let mut req = http_client.post(&url);
         if let Some(key) = &get_client().license_key {
             req = req.header("X-License-Key", key);
         }
-        let _ = req.send().await;
+
+        let mut file_payload = None;
+        if auto_analyze {
+            file_payload = resolve_incident_file(&payload);
+        }
+
+        if let Some(file_path) = file_payload {
+            if let Ok(mut file) = std::fs::File::open(&file_path) {
+                let mut buffer = Vec::new();
+                use std::io::Read;
+                if file.read_to_end(&mut buffer).is_ok() {
+                    let filename = file_path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "file".to_string());
+                    
+                    let part = reqwest::multipart::Part::bytes(buffer)
+                        .file_name(filename);
+                    
+                    let json_payload = serde_json::to_string(&payload).unwrap_or_default();
+                    let form = reqwest::multipart::Form::new()
+                        .text("alert", json_payload)
+                        .part("file", part);
+                    
+                    let _ = req.multipart(form).send().await;
+                    return;
+                }
+            }
+        }
+
+        let _ = req.json(&payload).send().await;
     });
 }
