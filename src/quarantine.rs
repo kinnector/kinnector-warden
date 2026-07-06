@@ -201,8 +201,5 @@ fn emit_quarantine_alert(
         },
     };
 
-    if let Ok(s) = serde_json::to_string(&payload) {
-        let _ = crate::audit::write_to_audit_log(&s);
-    }
     crate::notifications::dispatch_alert(payload);
 }

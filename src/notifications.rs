@@ -97,6 +97,12 @@ pub async fn load_notification_config() -> Option<NotificationConfig> {
 }
 
 pub fn dispatch_alert(payload: AlertPayload) {
+    if let Ok(s) = serde_json::to_string(&payload) {
+        let _ = crate::audit::write_to_audit_log(&s);
+        crate::cloud::queue_log_entry(&s);
+    }
+    crate::cloud::send_alert_immediate(&payload);
+
     tokio::spawn(async move {
         // Dedup: skip if same (threat_type, pid) fired within 5 min
         let dedup_key = format!("{}:{}", payload.threat_type, payload.process.pid);

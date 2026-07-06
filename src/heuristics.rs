@@ -911,11 +911,6 @@ pub fn null_terminated_str(buf: &[u8]) -> String {
 }
 
 fn log_and_dispatch(payload: crate::notifications::AlertPayload) {
-    if let Ok(s) = serde_json::to_string(&payload) {
-        let _ = crate::audit::write_to_audit_log(&s);
-        crate::cloud::queue_log_entry(&s);
-    }
-    crate::cloud::send_alert_immediate(&payload);
     crate::notifications::dispatch_alert(payload);
 }
 

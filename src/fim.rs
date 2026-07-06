@@ -135,9 +135,6 @@ fn process_fim_event(path: PathBuf, web_root: &str, is_deletion: bool, is_modify
                     status: format!("File deleted from web root: {}", path.display()),
                 },
             };
-            if let Ok(s) = serde_json::to_string(&payload) {
-                let _ = crate::audit::write_to_audit_log(&s);
-            }
             crate::notifications::dispatch_alert(payload);
             return;
         }
@@ -168,9 +165,6 @@ fn process_fim_event(path: PathBuf, web_root: &str, is_deletion: bool, is_modify
                                 status: format!("Allowlisted file modified in web root: {}", path.display()),
                             },
                         };
-                        if let Ok(s) = serde_json::to_string(&payload) {
-                            let _ = crate::audit::write_to_audit_log(&s);
-                        }
                         crate::notifications::dispatch_alert(payload);
                     }
                 } else {
@@ -209,9 +203,6 @@ fn process_fim_event(path: PathBuf, web_root: &str, is_deletion: bool, is_modify
                 status: format!("Server configuration file modified: {}", path.display()),
             },
         };
-        if let Ok(s) = serde_json::to_string(&payload) {
-            let _ = crate::audit::write_to_audit_log(&s);
-        }
         crate::notifications::dispatch_alert(payload);
     }
 }

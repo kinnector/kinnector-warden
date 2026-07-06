@@ -150,9 +150,6 @@ pub(crate) async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::E
                         },
                     };
 
-                    if let Ok(json_str) = serde_json::to_string(&payload) {
-                        let _ = crate::audit::write_to_audit_log(&json_str);
-                    }
                     crate::notifications::dispatch_alert(payload);
                 }
             }
