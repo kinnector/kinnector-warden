@@ -479,10 +479,7 @@ pub async fn send_inventory_sync(heuristics: &HeuristicsEngine) {
         }));
     }
 
-    let mut listening_ports = Vec::new();
-    for pid in heuristics.listening_pids.iter() {
-        listening_ports.push(*pid);
-    }
+    let listening_services = crate::discovery::get_listening_services();
 
     let mut packages = Vec::new();
     for root in &heuristics.web_roots {
@@ -492,7 +489,7 @@ pub async fn send_inventory_sync(heuristics: &HeuristicsEngine) {
     let payload = serde_json::json!({
         "web_roots": heuristics.web_roots,
         "proxies": proxies,
-        "listening_pids": listening_ports,
+        "listening_services": listening_services,
         "containers": containers,
         "packages": packages,
     });

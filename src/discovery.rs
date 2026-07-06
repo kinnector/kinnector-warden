@@ -545,5 +545,151 @@ async fn trigger_container_reconfig(id: &str, action: &str) {
     }
 }
 
+pub fn get_listening_services() -> Vec<serde_json::Value> {
+    use std::collections::{HashMap, HashSet};
+    let mut inode_to_port: HashMap<u64, u16> = HashMap::new();
+
+    let files = [
+        "/proc/net/tcp",
+        "/proc/net/tcp6",
+        "/proc/net/udp",
+        "/proc/net/udp6",
+    ];
+
+    for file_path in &files {
+        if let Ok(content) = std::fs::read_to_string(file_path) {
+            for line in content.lines().skip(1) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 9 {
+                    let local_addr = parts[1];
+                    let state = parts[3];
+                    let inode = parts[9];
+                    if state == "0A" || file_path.contains("udp") {
+                        if let Ok(inode_val) = inode.parse::<u64>() {
+                            if inode_val > 0 {
+                                if let Some(port_hex) = local_addr.split(':').nth(1) {
+                                    if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                                        inode_to_port.insert(inode_val, port);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pid_to_ports: HashMap<u32, HashSet<u16>> = HashMap::new();
+
+    if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+        for entry in proc_dir.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
+
+            let fd_path = entry.path().join("fd");
+            if let Ok(fd_dir) = std::fs::read_dir(fd_path) {
+                for fd_entry in fd_dir.flatten() {
+                    if let Ok(link) = std::fs::read_link(fd_entry.path()) {
+                        let link_str = link.to_string_lossy();
+                        if link_str.starts_with("socket:[") && link_str.ends_with(']') {
+                            let inode_str = &link_str[8..link_str.len() - 1];
+                            if let Ok(inode_val) = inode_str.parse::<u64>() {
+                                if let Some(&port) = inode_to_port.get(&inode_val) {
+                                    pid_to_ports.entry(pid).or_default().insert(port);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut services = Vec::new();
+    for (pid, ports) in pid_to_ports {
+        let exe_path = format!("/proc/{}/exe", pid);
+        let cwd_path = format!("/proc/{}/cwd", pid);
+
+        let exe = std::fs::read_link(&exe_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let cwd = std::fs::read_link(&cwd_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if exe.is_empty() {
+            continue;
+        }
+
+        let stack = detect_process_stack(pid, &exe);
+
+        services.push(serde_json::json!({
+            "pid": pid,
+            "exe": exe,
+            "cwd": cwd,
+            "stack": stack,
+            "ports": ports.into_iter().collect::<Vec<_>>(),
+        }));
+    }
+
+    services
+}
+
+fn detect_process_stack(pid: u32, exe_path: &str) -> String {
+    let exe_lower = exe_path.to_lowercase();
+    if exe_lower.contains("node") {
+        return "Node.js".to_string();
+    }
+    if exe_lower.contains("python") {
+        return "Python".to_string();
+    }
+    if exe_lower.contains("php") {
+        return "PHP".to_string();
+    }
+    if exe_lower.contains("java") {
+        return "Java".to_string();
+    }
+    if exe_lower.contains("ruby") {
+        return "Ruby".to_string();
+    }
+    if exe_lower.contains("nginx") {
+        return "Nginx".to_string();
+    }
+    if exe_lower.contains("httpd") || exe_lower.contains("apache") {
+        return "Apache".to_string();
+    }
+    if exe_lower.contains("caddy") {
+        return "Caddy".to_string();
+    }
+
+    // Check mapping for JVM or Go/Rust patterns
+    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+        if maps.contains("libjvm.so") {
+            return "Java (JVM)".to_string();
+        }
+        if maps.contains("libgo.so") {
+            return "Go (Shared)".to_string();
+        }
+    }
+
+    // Check ELF signatures for Go or Rust
+    if let Ok(bytes) = std::fs::read(format!("/proc/{}/exe", pid)) {
+        let content_str = String::from_utf8_lossy(&bytes[..20000.min(bytes.len())]);
+        if content_str.contains("Go build ID") || content_str.contains("runtime.goexit") {
+            return "Go (Compiled)".to_string();
+        }
+        if content_str.contains("rust_panic") || content_str.contains("_ZN4rust") {
+            return "Rust (Compiled)".to_string();
+        }
+    }
+
+    "Native (C/C++)".to_string()
+}
+
 
 
