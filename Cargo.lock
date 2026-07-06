@@ -994,6 +994,7 @@ dependencies = [
  "libc",
  "nix",
  "notify",
+ "openssl",
  "prost",
  "regex",
  "reqwest",

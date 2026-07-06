@@ -303,6 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8e. Start Forensic TLS Request Buffer server (Paid Tier)
     crate::tls_buffer::start_tls_telemetry_server();
+    crate::tls_buffer::start_transparent_proxy();
 
     // 8f. Start Cloud Services (updates, streaming, remote commands)
     crate::cloud::start_cloud_services(Arc::clone(&heuristics));
@@ -385,6 +386,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!("Warden daemon stopped.");
+    // Remove proxy redirection iptables rules on exit
+    crate::tls_buffer::remove_proxy_routing();
     // Remove PID file on clean exit (P1-9)
     let _ = std::fs::remove_file(pid_file_path);
     // Cleanup low-level telemetry resources

@@ -400,3 +400,309 @@ pub fn flush_on_alert(pid: u32, alert_id: &str) {
         crate::cloud::send_forensic_payload(&alert_id_owned, compressed).await;
     });
 }
+
+use openssl::x509::{X509, X509Name};
+use openssl::pkey::{PKey, Private};
+use openssl::rsa::Rsa;
+use openssl::hash::MessageDigest;
+use openssl::ssl::{SslMethod, SslAcceptor, SslConnector, SslVerifyMode};
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::os::unix::io::AsRawFd;
+
+fn generate_ca() -> (X509, PKey<Private>) {
+    let rsa = Rsa::generate(2048).unwrap();
+    let pkey = PKey::from_rsa(rsa).unwrap();
+
+    let mut name = X509Name::builder().unwrap();
+    name.append_entry_by_text("CN", "Kinnector Root CA").unwrap();
+    let name = name.build();
+
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    builder.set_pubkey(&pkey).unwrap();
+
+    let not_before = openssl::asn1::Asn1Time::days_from_now(0).unwrap();
+    let not_after = openssl::asn1::Asn1Time::days_from_now(3650).unwrap();
+    builder.set_not_before(&not_before).unwrap();
+    builder.set_not_after(&not_after).unwrap();
+
+    let ext = openssl::x509::extension::BasicConstraints::new()
+        .ca()
+        .build()
+        .unwrap();
+    builder.append_extension(ext).unwrap();
+
+    builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+    let x509 = builder.build();
+
+    (x509, pkey)
+}
+
+fn generate_server_cert(host: &str, ca_cert: &X509, ca_key: &PKey<Private>) -> (X509, PKey<Private>) {
+    let rsa = Rsa::generate(2048).unwrap();
+    let pkey = PKey::from_rsa(rsa).unwrap();
+
+    let mut name = X509Name::builder().unwrap();
+    name.append_entry_by_text("CN", host).unwrap();
+    let name = name.build();
+
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(ca_cert.subject_name()).unwrap();
+    builder.set_pubkey(&pkey).unwrap();
+
+    let not_before = openssl::asn1::Asn1Time::days_from_now(0).unwrap();
+    let not_after = openssl::asn1::Asn1Time::days_from_now(365).unwrap();
+    builder.set_not_before(&not_before).unwrap();
+    builder.set_not_after(&not_after).unwrap();
+
+    let context = builder.x509v3_context(Some(ca_cert), None);
+    let san = openssl::x509::extension::SubjectAlternativeName::new()
+        .dns(host)
+        .build(&context)
+        .unwrap();
+    builder.append_extension(san).unwrap();
+
+    builder.sign(ca_key, MessageDigest::sha256()).unwrap();
+    let x509 = builder.build();
+
+    (x509, pkey)
+}
+
+fn load_ca() -> (X509, PKey<Private>) {
+    let cert_bytes = std::fs::read("/etc/kinnector/ca.crt").unwrap();
+    let key_bytes = std::fs::read("/etc/kinnector/ca.key").unwrap();
+    let cert = X509::from_pem(&cert_bytes).unwrap();
+    let key = PKey::private_key_from_pem(&key_bytes).unwrap();
+    (cert, key)
+}
+
+fn load_or_generate_ca() -> (X509, PKey<Private>) {
+    if std::path::Path::new("/etc/kinnector/ca.crt").exists() && std::path::Path::new("/etc/kinnector/ca.key").exists() {
+        if let Ok((cert, key)) = std::panic::catch_unwind(|| load_ca()) {
+            return (cert, key);
+        }
+    }
+    let _ = std::fs::create_dir_all("/etc/kinnector");
+    let (cert, key) = generate_ca();
+    let _ = std::fs::write("/etc/kinnector/ca.crt", cert.to_pem().unwrap());
+    let _ = std::fs::write("/etc/kinnector/ca.key", key.private_key_to_pem_pkcs8().unwrap());
+    (cert, key)
+}
+
+fn get_original_dst(fd: std::os::unix::io::RawFd) -> Option<std::net::SocketAddr> {
+    unsafe {
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        let res = libc::getsockopt(
+            fd,
+            libc::SOL_IP,
+            libc::SO_ORIGINAL_DST,
+            &mut addr as *mut _ as *mut _,
+            &mut len,
+        );
+        if res == 0 {
+            let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+            let port = u16::from_be(addr.sin_port);
+            Some(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))
+        } else {
+            None
+        }
+    }
+}
+
+pub fn apply_proxy_routing() {
+    let _ = std::process::Command::new("iptables")
+        .args([
+            "-t", "nat", "-A", "OUTPUT",
+            "-p", "tcp", "--dport", "443",
+            "-m", "owner", "!", "--uid-owner", "0",
+            "-j", "REDIRECT", "--to-ports", "8443"
+        ])
+        .status();
+
+    let _ = std::process::Command::new("ip6tables")
+        .args([
+            "-t", "nat", "-A", "OUTPUT",
+            "-p", "tcp", "--dport", "443",
+            "-m", "owner", "!", "--uid-owner", "0",
+            "-j", "REDIRECT", "--to-ports", "8443"
+        ])
+        .status();
+}
+
+pub fn remove_proxy_routing() {
+    let _ = std::process::Command::new("iptables")
+        .args([
+            "-t", "nat", "-D", "OUTPUT",
+            "-p", "tcp", "--dport", "443",
+            "-m", "owner", "!", "--uid-owner", "0",
+            "-j", "REDIRECT", "--to-ports", "8443"
+        ])
+        .status();
+
+    let _ = std::process::Command::new("ip6tables")
+        .args([
+            "-t", "nat", "-D", "OUTPUT",
+            "-p", "tcp", "--dport", "443",
+            "-m", "owner", "!", "--uid-owner", "0",
+            "-j", "REDIRECT", "--to-ports", "8443"
+        ])
+        .status();
+}
+
+static PROXY_ACTIVE: OnceLock<bool> = OnceLock::new();
+
+pub fn start_transparent_proxy() {
+    PROXY_ACTIVE.get_or_init(|| {
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:8443").await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("[Warden Proxy] Failed to bind transparent proxy port: {}", e);
+                    return;
+                }
+            };
+            
+            apply_proxy_routing();
+
+            let (ca_cert, ca_key) = load_or_generate_ca();
+
+            while let Ok((client_stream, _)) = listener.accept().await {
+                let ca_cert = ca_cert.clone();
+                let ca_key = ca_key.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    let raw_fd = client_stream.as_raw_fd();
+                    let Some(orig_dst) = get_original_dst(raw_fd) else { return; };
+                    
+                    let client_tcp = match client_stream.into_std() {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    client_tcp.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+
+                    let hostname = Arc::new(Mutex::new(String::new()));
+                    let hostname_clone = Arc::clone(&hostname);
+
+                    let mut acceptor_builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+                    let (fallback_cert, fallback_key) = generate_server_cert(&orig_dst.ip().to_string(), &ca_cert, &ca_key);
+                    acceptor_builder.set_certificate(&fallback_cert).unwrap();
+                    acceptor_builder.set_private_key(&fallback_key).unwrap();
+
+                    let ca_cert_clone = ca_cert.clone();
+                    let ca_key_clone = ca_key.clone();
+
+                    acceptor_builder.set_servername_callback(move |ssl, _| {
+                        if let Some(name) = ssl.servername(openssl::ssl::NameType::HOST_NAME) {
+                            if let Ok(mut h) = hostname_clone.lock() {
+                                *h = name.to_string();
+                            }
+                            let (cert, key) = generate_server_cert(name, &ca_cert_clone, &ca_key_clone);
+                            ssl.set_certificate(&cert).unwrap();
+                            ssl.set_private_key(&key).unwrap();
+                        }
+                        Ok(())
+                    });
+
+                    let acceptor = acceptor_builder.build();
+                    let mut client_tls = match acceptor.accept(client_tcp) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+
+                    let target_host = {
+                        let h = hostname.lock().unwrap();
+                        if h.is_empty() {
+                            orig_dst.ip().to_string()
+                        } else {
+                            h.clone()
+                        }
+                    };
+
+                    let server_tcp = match std::net::TcpStream::connect(orig_dst) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    server_tcp.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+
+                    let mut connector_builder = SslConnector::builder(SslMethod::tls()).unwrap();
+                    if target_host == orig_dst.ip().to_string() {
+                        connector_builder.set_verify(SslVerifyMode::NONE);
+                    }
+                    let connector = connector_builder.build();
+
+                    let mut server_tls = match connector.connect(&target_host, server_tcp) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+
+                    let mut buffer = vec![0u8; 8192];
+                    loop {
+                        match client_tls.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as u64;
+                                let record = TlsRecord {
+                                    arrival_time: Instant::now(),
+                                    timestamp_ns: timestamp,
+                                    pid: 0,
+                                    tid: 0,
+                                    container_id: String::new(),
+                                    direction: 1, // OUTBOUND
+                                    tls_layer: 4, // Proxy
+                                    payload: buffer[..n].to_vec(),
+                                };
+                                add_record(record);
+
+                                if server_tls.write_all(&buffer[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => break,
+                        }
+
+                        match server_tls.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as u64;
+                                let record = TlsRecord {
+                                    arrival_time: Instant::now(),
+                                    timestamp_ns: timestamp,
+                                    pid: 0,
+                                    tid: 0,
+                                    container_id: String::new(),
+                                    direction: 0, // INBOUND
+                                    tls_layer: 4, // Proxy
+                                    payload: buffer[..n].to_vec(),
+                                };
+                                add_record(record);
+
+                                if client_tls.write_all(&buffer[..n]).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => break,
+                        }
+                        
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                });
+            }
+        });
+        true
+    });
+}
+

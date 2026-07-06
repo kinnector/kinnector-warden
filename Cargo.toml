@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tonic = { version = "0.10", features = ["tls-webpki-roots"] }
 prost = "0.12"
 futures-core = "0.3"
+openssl = "0.10"
 
 [build-dependencies]
 tonic-build = "0.10"
