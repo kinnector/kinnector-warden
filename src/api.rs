@@ -277,19 +277,31 @@ async fn handle_http_request(
                 _ => build_error_response(400, "Missing quarantine_path or original_path"),
             }
         }
-        _ => build_error_response(444, "Not Found"),
+        _ => build_error_response(404, "Not Found"),
+    }
+}
+
+fn status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        400 => "Bad Request",
+        402 => "Payment Required",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Unknown Status",
     }
 }
 
 fn build_json_response(status_code: u16, value: &serde_json::Value) -> String {
     let body = serde_json::to_string(value).unwrap_or_default();
     format!(
-        "HTTP/1.1 {} OK\r\n\
+        "HTTP/1.1 {} {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n\
          {}",
         status_code,
+        status_text(status_code),
         body.len(),
         body
     )
@@ -304,7 +316,7 @@ fn build_error_response(status_code: u16, message: &str) -> String {
          Connection: close\r\n\r\n\
          {}",
         status_code,
-        message,
+        status_text(status_code),
         body.len(),
         body
     )
