@@ -46,12 +46,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // 1. Resolve BPF object path
-    let bpf_packaged_path = "/usr/lib/kinnector/kinnector.bpf.o";
-    let bpf_path = if std::path::Path::new(bpf_packaged_path).exists() {
-        bpf_packaged_path
-    } else {
-        "/home/user/Documents/kinnector/kinnector-core/build/kinnector.bpf.o"
-    };
+    let bpf_path = "/usr/lib/kinnector/kinnector.bpf.o";
+    if !std::path::Path::new(bpf_path).exists() {
+        // Also allow the path to be overridden via KINNECTOR_BPF_PATH env var for dev builds
+        let env_path = std::env::var("KINNECTOR_BPF_PATH").ok();
+        if env_path.as_deref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false) {
+            // env override exists — use it (development mode)
+            println!("[Warden] DEV: Using BPF object from KINNECTOR_BPF_PATH env override.");
+        } else {
+            eprintln!(
+                "[Warden] Fatal: BPF object not found at '{}'. \
+                 Install the kinnector-core package or set KINNECTOR_BPF_PATH for development builds.",
+                bpf_path
+            );
+            std::process::exit(1);
+        }
+    }
+    let bpf_path = std::env::var("KINNECTOR_BPF_PATH")
+        .unwrap_or_else(|_| bpf_path.to_string());
 
     // B-08 & Section 1: Load config values from /etc/kinnector/core.conf dynamically
     let telemetry_socket = args.telemetry_socket.clone();

@@ -10,37 +10,55 @@ use notify::{Watcher, RecursiveMode, EventKind};
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
 use std::sync::OnceLock;
+use dashmap::DashMap;
 
 pub enum FimCommand {
     Watch(PathBuf),
     Unwatch(PathBuf),
 }
 
-static FIM_CMD_TX: OnceLock<tokio::sync::mpsc::Sender<FimCommand>> = OnceLock::new();
+/// Registry of all active FIM watcher channels, keyed by the root path they were started for.
+/// Using a DashMap fixes the OnceLock bug where only the first watcher was reachable.
+static FIM_WATCHERS: OnceLock<DashMap<String, tokio::sync::mpsc::Sender<FimCommand>>> = OnceLock::new();
+
+fn watcher_registry() -> &'static DashMap<String, tokio::sync::mpsc::Sender<FimCommand>> {
+    FIM_WATCHERS.get_or_init(DashMap::new)
+}
 
 /// Request FIM to watch a new path dynamically.
+/// Broadcasts to ALL registered watcher channels.
 pub fn add_fim_watch_path(path: PathBuf) -> bool {
-    if let Some(tx) = FIM_CMD_TX.get() {
-        tx.try_send(FimCommand::Watch(path)).is_ok()
-    } else {
-        false
+    let reg = watcher_registry();
+    if reg.is_empty() { return false; }
+    let mut any_ok = false;
+    for entry in reg.iter() {
+        if entry.value().try_send(FimCommand::Watch(path.clone())).is_ok() {
+            any_ok = true;
+        }
     }
+    any_ok
 }
 
 /// Request FIM to stop watching a path dynamically.
+/// Broadcasts to ALL registered watcher channels.
 pub fn remove_fim_watch_path(path: PathBuf) -> bool {
-    if let Some(tx) = FIM_CMD_TX.get() {
-        tx.try_send(FimCommand::Unwatch(path)).is_ok()
-    } else {
-        false
+    let reg = watcher_registry();
+    if reg.is_empty() { return false; }
+    let mut any_ok = false;
+    for entry in reg.iter() {
+        if entry.value().try_send(FimCommand::Unwatch(path.clone())).is_ok() {
+            any_ok = true;
+        }
     }
+    any_ok
 }
 
 pub fn start_fim_watcher(web_root: String, config_dirs: Vec<PathBuf>) {
     tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<FimCommand>(20);
-        let _ = FIM_CMD_TX.set(cmd_tx);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<FimCommand>(64);
+        // Register this watcher in the global registry keyed by web_root.
+        watcher_registry().insert(web_root.clone(), cmd_tx);
 
         // Mutex/Cell wrapper not needed since notify RecommendedWatcher has internal mutability
         let mut watcher = match notify::recommended_watcher(move |res| {

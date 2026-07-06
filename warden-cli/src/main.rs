@@ -11,10 +11,14 @@
 //!   warden-cli firewall unblock <ip>
 //!   warden-cli fim status
 //!   warden-cli fim add <path>
+//!   warden-cli fim remove <path>
 //!   warden-cli fim register --git
 //!   warden-cli fim register --path <file>
+//!   warden-cli allowlist add <path>
+//!   warden-cli allowlist remove <path>
 //!   warden-cli scan now
 //!   warden-cli rules reload
+//!   warden-cli rules fetch
 //!   warden-cli test-alert
 //!   warden-cli version
 
@@ -63,6 +67,12 @@ enum Commands {
     Fim {
         #[command(subcommand)]
         action: FimAction,
+    },
+
+    /// Inode allowlist management
+    Allowlist {
+        #[command(subcommand)]
+        action: AllowlistAction,
     },
 
     /// OSV dependency vulnerability scanner
@@ -123,6 +133,11 @@ enum FimAction {
         /// Path to watch
         path: String,
     },
+    /// Dynamically remove a path from FIM watch list
+    Remove {
+        /// Path to stop watching
+        path: String,
+    },
     /// Register inodes into the allowlist
     Register {
         /// Re-seed allowlist from git ls-files
@@ -131,6 +146,20 @@ enum FimAction {
         /// Register a single specific file
         #[arg(long)]
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AllowlistAction {
+    /// Recursively register a path and its inodes into the allowlist
+    Add {
+        /// Path to register
+        path: String,
+    },
+    /// Recursively remove a path and its inodes from the allowlist
+    Remove {
+        /// Path to deregister
+        path: String,
     },
 }
 
@@ -163,6 +192,7 @@ fn main() {
         Commands::Quarantine { action } => cmd_quarantine(action),
         Commands::Firewall { action } => cmd_firewall(action),
         Commands::Fim { action } => cmd_fim(action),
+        Commands::Allowlist { action } => cmd_allowlist(action),
         Commands::Scan { action } => cmd_scan(action),
         Commands::Rules { action } => cmd_rules(action),
         Commands::Containers => cmd_containers(),
@@ -414,6 +444,14 @@ fn cmd_fim(action: FimAction) {
                 Err(e) => eprintln!("Failed to add FIM path: {}", e.red()),
             }
         }
+        FimAction::Remove { path } => {
+            println!("[warden-cli] Removing path from FIM watch: {}", path.yellow());
+            let body = serde_json::json!({ "path": path });
+            match query_daemon("POST", "/api/v1/fim/remove", Some(&body)) {
+                Ok(_) => println!("{}", "FIM watch path removed successfully.".green()),
+                Err(e) => eprintln!("Failed to remove FIM path: {}", e.red()),
+            }
+        }
         FimAction::Register { git, path } => {
             let body = if git {
                 serde_json::json!({ "git": true })
@@ -431,6 +469,36 @@ fn cmd_fim(action: FimAction) {
                     println!("{}", format!("Allowlist updated successfully: {}", status).green());
                 }
                 Err(e) => eprintln!("Failed to register allowlist: {}", e.red()),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Allowlist
+// ---------------------------------------------------------------------------
+fn cmd_allowlist(action: AllowlistAction) {
+    match action {
+        AllowlistAction::Add { path } => {
+            println!("[warden-cli] Registering path in allowlist: {}", path.yellow());
+            let body = serde_json::json!({ "path": path });
+            match query_daemon("POST", "/api/v1/allowlist/add", Some(&body)) {
+                Ok(res) => {
+                    let status = res.get("status").and_then(|s| s.as_str()).unwrap_or("registered");
+                    println!("{}", format!("Allowlist updated: {} ({})", path, status).green());
+                }
+                Err(e) => eprintln!("Failed to add to allowlist: {}", e.red()),
+            }
+        }
+        AllowlistAction::Remove { path } => {
+            println!("[warden-cli] Removing path from allowlist: {}", path.yellow());
+            let body = serde_json::json!({ "path": path });
+            match query_daemon("POST", "/api/v1/allowlist/remove", Some(&body)) {
+                Ok(res) => {
+                    let status = res.get("status").and_then(|s| s.as_str()).unwrap_or("deregistered");
+                    println!("{}", format!("Allowlist updated: {} ({})", path, status).green());
+                }
+                Err(e) => eprintln!("Failed to remove from allowlist: {}", e.red()),
             }
         }
     }
