@@ -169,6 +169,49 @@ async fn handle_http_request(
                 None => build_error_response(400, "Missing path parameter"),
             }
         }
+        ("POST", "/api/v1/fim/remove") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let path_val = json_body.get("path").and_then(|p| p.as_str());
+            match path_val {
+                Some(p) => {
+                    let path = PathBuf::from(p);
+                    if crate::fim::remove_fim_watch_path(path) {
+                        build_json_response(200, &json!({ "status": "removed" }))
+                    } else {
+                        build_json_response(500, &json!({ "error": "Failed to send unwatch command" }))
+                    }
+                }
+                None => build_error_response(400, "Missing path parameter"),
+            }
+        }
+        ("POST", "/api/v1/allowlist/add") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let path_val = json_body.get("path").and_then(|p| p.as_str());
+            match path_val {
+                Some(p) => {
+                    crate::allowlist::register_path_recursive(p);
+                    build_json_response(200, &json!({ "status": "registered", "path": p }))
+                }
+                None => build_error_response(400, "Missing path parameter"),
+            }
+        }
+        ("POST", "/api/v1/allowlist/remove") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let path_val = json_body.get("path").and_then(|p| p.as_str());
+            match path_val {
+                Some(p) => {
+                    crate::allowlist::deregister_path_recursive(p);
+                    build_json_response(200, &json!({ "status": "deregistered", "path": p }))
+                }
+                None => build_error_response(400, "Missing path parameter"),
+            }
+        }
         ("POST", "/api/v1/fim/register") => {
             let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
                 return build_error_response(400, "Invalid JSON");

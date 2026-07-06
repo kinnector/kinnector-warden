@@ -396,6 +396,24 @@ async fn process_cloud_command(cmd: serde_json::Value, heuristics: &HeuristicsEn
                 let _ = crate::fim::add_fim_watch_path(std::path::PathBuf::from(path));
             }
         }
+        "fim_remove" => {
+            if let Some(path) = cmd.get("path").and_then(|p| p.as_str()) {
+                println!("[Warden Cloud] Remote command: Removing FIM watch path {}", path);
+                let _ = crate::fim::remove_fim_watch_path(std::path::PathBuf::from(path));
+            }
+        }
+        "allowlist_add" => {
+            if let Some(path) = cmd.get("path").and_then(|p| p.as_str()) {
+                println!("[Warden Cloud] Remote command: Registering path in allowlist: {}", path);
+                crate::allowlist::register_path_recursive(path);
+            }
+        }
+        "allowlist_remove" => {
+            if let Some(path) = cmd.get("path").and_then(|p| p.as_str()) {
+                println!("[Warden Cloud] Remote command: Deregistering path from allowlist: {}", path);
+                crate::allowlist::deregister_path_recursive(path);
+            }
+        }
         _ => {
             eprintln!("[Warden Cloud] Unknown remote command action: {}", action);
         }
