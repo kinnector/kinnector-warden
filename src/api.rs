@@ -114,8 +114,10 @@ async fn handle_http_request(
         ("GET", "/api/v1/status") => {
             let is_lsm = unsafe { crate::ffi::is_lsm_active() };
             let uptime = startup_time.elapsed().as_secs();
+            let is_paid = crate::tls_buffer::is_paid_tier();
             let state_json = json!({
-                "status": "active",
+                "status": if is_paid { "licensed" } else { "active" },
+                "tier": if is_paid { "paid" } else { "free" },
                 "version": "0.1.0",
                 "lsm_active": is_lsm,
                 "uptime_secs": uptime,

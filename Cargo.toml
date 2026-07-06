@@ -17,3 +17,5 @@ dashmap = "5.5"
 semver = "1.0"
 uuid = { version = "1", features = ["v4"] }
 kinnector-config = { path = "../kinnector-config" }
+regex = "1.10"
+zstd = "0.13"

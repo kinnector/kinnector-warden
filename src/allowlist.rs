@@ -470,3 +470,31 @@ fn emit_commit_alert(
     }
     crate::notifications::dispatch_alert(payload);
 }
+
+pub fn register_path_recursive(root: &str) {
+    if let Some(set) = ALLOWED_INODES.get() {
+        walk_seed(set, root);
+    }
+}
+
+pub fn deregister_path_recursive(root: &str) {
+    let Some(set) = ALLOWED_INODES.get() else { return; };
+    
+    fn recurse(set: &DashSet<u64>, dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                if meta.is_file() {
+                    let ino = meta.ino();
+                    if set.remove(&ino).is_some() {
+                        println!("[Warden Allowlist] Deregistered inode {} — {}", ino, path.display());
+                    }
+                } else if meta.is_dir() {
+                    recurse(set, &path);
+                }
+            }
+        }
+    }
+    recurse(set, std::path::Path::new(root));
+}

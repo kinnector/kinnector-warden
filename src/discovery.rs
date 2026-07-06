@@ -496,25 +496,52 @@ async fn query_single_container(id: &str) -> Option<ContainerInfo> {
     })
 }
 
+use dashmap::DashMap;
+use std::sync::{Arc, OnceLock};
+
+static ACTIVE_CONTAINER_MOUNTS: OnceLock<Arc<DashMap<String, Vec<PathBuf>>>> = OnceLock::new();
+
+fn get_active_container_mounts() -> &'static Arc<DashMap<String, Vec<PathBuf>>> {
+    ACTIVE_CONTAINER_MOUNTS.get_or_init(|| Arc::new(DashMap::new()))
+}
+
+pub fn register_container_mounts(id: &str, mounts: Vec<PathBuf>) {
+    get_active_container_mounts().insert(id.to_string(), mounts);
+}
+
 async fn trigger_container_reconfig(id: &str, action: &str) {
     if action == "start" {
         if let Some(c) = query_single_container(id).await {
             println!("[Warden Docker] Dynamic event: Started container {} (Image: {})", c.name, c.image);
+            let mut mounts = Vec::new();
             for wr in c.web_roots {
                 println!("[Warden Docker] Dynamically adding FIM watch and allowlist for: {}", wr.display());
                 crate::fim::add_fim_watch_path(wr.clone());
                 let wr_str = wr.to_string_lossy().to_string();
                 tokio::task::block_in_place(|| {
-                    crate::allowlist::register_inode(&wr_str);
+                    crate::allowlist::register_path_recursive(&wr_str);
                 });
+                mounts.push(wr);
             }
             for cd in c.config_dirs {
                 println!("[Warden Docker] Dynamically adding FIM watch for config: {}", cd.display());
-                crate::fim::add_fim_watch_path(cd);
+                crate::fim::add_fim_watch_path(cd.clone());
+                mounts.push(cd);
             }
+            register_container_mounts(id, mounts);
         }
     } else {
         println!("[Warden Docker] Dynamic event: Stopped container {}", id);
+        if let Some((_, mounts)) = get_active_container_mounts().remove(id) {
+            for mount in mounts {
+                println!("[Warden Docker] Dynamically removing FIM watch and allowlist for stopped container mount: {}", mount.display());
+                crate::fim::remove_fim_watch_path(mount.clone());
+                let mount_str = mount.to_string_lossy();
+                tokio::task::block_in_place(|| {
+                    crate::allowlist::deregister_path_recursive(&mount_str);
+                });
+            }
+        }
     }
 }
 

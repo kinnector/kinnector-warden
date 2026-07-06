@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use tokio::net::UnixListener;
 use tokio::io::AsyncReadExt;
 use chrono::Utc;
+use regex::Regex;
 
 #[derive(Clone, Debug)]
 pub struct TlsRecord {
@@ -35,21 +36,110 @@ struct ProcessBuffer {
     total_bytes: usize,
 }
 
+struct TlsBufferConfig {
+    pub capacity_bytes: usize,
+    pub global_capacity_bytes: usize,
+    pub redact_headers: Vec<String>,
+    pub exclude_paths: Vec<Regex>,
+}
+
+static CONFIG: OnceLock<TlsBufferConfig> = OnceLock::new();
 static TLS_BUFFERS: OnceLock<DashMap<u32, Mutex<ProcessBuffer>>> = OnceLock::new();
 
 fn get_buffers() -> &'static DashMap<u32, Mutex<ProcessBuffer>> {
     TLS_BUFFERS.get_or_init(DashMap::new)
 }
 
-// Max buffer size per process: 32 MB
-const MAX_PROC_BUFFER_BYTES: usize = 32 * 1024 * 1024;
-// Max buffer size globally across all processes: 256 MB
-const MAX_GLOBAL_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+fn get_config() -> &'static TlsBufferConfig {
+    CONFIG.get_or_init(|| {
+        let conf = std::fs::read_to_string("/etc/kinnector/core.conf").unwrap_or_default();
+        let mut capacity_bytes = 32 * 1024 * 1024;
+        let mut global_capacity_bytes = 256 * 1024 * 1024;
+        let mut redact_headers = vec![
+            "Authorization".to_string(),
+            "Cookie".to_string(),
+            "Set-Cookie".to_string(),
+        ];
+        let mut exclude_paths = Vec::new();
+
+        for line in conf.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() { continue; }
+            if let Some(pos) = line.find('=') {
+                let key = line[..pos].trim();
+                let val = line[pos+1..].trim();
+                match key {
+                    "tls_buffer.capacity_mb" => {
+                        if let Ok(mb) = val.parse::<usize>() {
+                            capacity_bytes = mb * 1024 * 1024;
+                        }
+                    }
+                    "tls_buffer.global_capacity_mb" => {
+                        if let Ok(mb) = val.parse::<usize>() {
+                            global_capacity_bytes = mb * 1024 * 1024;
+                        }
+                    }
+                    "tls_buffer.redact_headers" => {
+                        redact_headers = val.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    "tls_buffer.exclude_paths" => {
+                        exclude_paths = val.split(',')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .filter_map(|s| Regex::new(s).ok())
+                            .collect();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        TlsBufferConfig {
+            capacity_bytes,
+            global_capacity_bytes,
+            redact_headers,
+            exclude_paths,
+        }
+    })
+}
+
+pub fn is_paid_tier() -> bool {
+    let conf = std::fs::read_to_string("/etc/kinnector/core.conf").unwrap_or_default();
+    conf.lines()
+        .find(|l| l.starts_with("license_key="))
+        .map(|l| l.trim_start_matches("license_key=").trim())
+        .map(|val| !val.is_empty() && val != "free")
+        .unwrap_or(false)
+}
+
+fn should_exclude_payload(payload: &[u8]) -> bool {
+    let config = get_config();
+    if config.exclude_paths.is_empty() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(payload);
+    for re in &config.exclude_paths {
+        if re.is_match(&text) {
+            return true;
+        }
+    }
+    false
+}
 
 pub fn add_record(record: TlsRecord) {
+    if should_exclude_payload(&record.payload) {
+        return;
+    }
+
     let pid = record.pid;
     let record_len = record.payload.len();
     let buffers = get_buffers();
+    let config = get_config();
+    let max_proc = config.capacity_bytes;
+    let max_global = config.global_capacity_bytes;
     
     // Check global size first to prevent memory exhaustion
     let mut global_bytes = 0;
@@ -60,8 +150,7 @@ pub fn add_record(record: TlsRecord) {
     }
     
     // If global limit reached, evict oldest records across all buffers
-    if global_bytes + record_len > MAX_GLOBAL_BUFFER_BYTES {
-        // Find process buffer with largest size and evict oldest record
+    if global_bytes + record_len > max_global {
         let mut largest_pid = None;
         let mut largest_bytes = 0;
         for entry in buffers.iter() {
@@ -92,7 +181,7 @@ pub fn add_record(record: TlsRecord) {
 
     if let Ok(mut buf) = entry.value().lock() {
         // Evict oldest from this PID until space is available
-        while buf.total_bytes + record_len > MAX_PROC_BUFFER_BYTES && !buf.records.is_empty() {
+        while buf.total_bytes + record_len > max_proc && !buf.records.is_empty() {
             if let Some(old) = buf.records.pop_front() {
                 buf.total_bytes -= old.payload.len();
             }
@@ -135,7 +224,6 @@ pub fn start_tls_telemetry_server() {
                         let mut header_buf = vec![0u8; header_size];
 
                         loop {
-                            // 1. Read header
                             if stream.read_exact(&mut header_buf).await.is_err() {
                                 break;
                             }
@@ -149,13 +237,11 @@ pub fn start_tls_telemetry_server() {
                                 break;
                             }
 
-                            // 2. Read payload
                             let mut payload = vec![0u8; payload_len];
                             if stream.read_exact(&mut payload).await.is_err() {
                                 break;
                             }
 
-                            // 3. Convert container ID to string
                             let container_id = String::from_utf8_lossy(&header.container_id)
                                 .trim_end_matches('\0')
                                 .to_string();
@@ -182,10 +268,14 @@ pub fn start_tls_telemetry_server() {
 }
 
 pub fn flush_on_alert(pid: u32, alert_id: &str) {
+    if !is_paid_tier() {
+        println!("[Warden TLS] Free tier active: forensic ring buffer captured locally in memory but not flushed (requires paid tier license).");
+        return;
+    }
+
     let alert_id_owned = alert_id.to_string();
     let buffers = get_buffers();
     tokio::spawn(async move {
-        // Capture pre-event window (now)
         let alert_time = Instant::now();
         println!("[Warden TLS] Alert triggered for PID {}. Preparing forensic flush (alert: {})...", pid, alert_id_owned);
 
@@ -197,7 +287,6 @@ pub fn flush_on_alert(pid: u32, alert_id: &str) {
         if let Some(entry) = buffers.get(&pid) {
             if let Ok(buf) = entry.value().lock() {
                 for rec in &buf.records {
-                    // Check if it falls within 60s before and 30s after the alert
                     let time_diff = if rec.arrival_time < alert_time {
                         alert_time.duration_since(rec.arrival_time)
                     } else {
@@ -218,20 +307,23 @@ pub fn flush_on_alert(pid: u32, alert_id: &str) {
             return;
         }
 
-        // Format and save forensic packet to disk
-        let output_path = format!("/var/log/kinnector/forensic_{}.json", alert_id_owned);
         let mut json_records = Vec::new();
+        let config = get_config();
+        
         for rec in &collected {
-            // Redact headers if configured (Privacy controls: Section 7.D)
             let mut payload_str = String::from_utf8_lossy(&rec.payload).to_string();
-            // Basic header redaction (Authorization, Cookie)
-            for header in &["Authorization:", "Cookie:", "Set-Cookie:"] {
-                if let Some(idx) = payload_str.to_lowercase().find(&header.to_lowercase()) {
-                    // Redact the rest of the line
+            
+            for header in &config.redact_headers {
+                let header_colon = if header.ends_with(':') {
+                    header.clone()
+                } else {
+                    format!("{}:", header)
+                };
+                if let Some(idx) = payload_str.to_lowercase().find(&header_colon.to_lowercase()) {
                     if let Some(end_line) = payload_str[idx..].find('\n') {
                         let line_start = idx;
                         let line_end = idx + end_line;
-                        payload_str.replace_range(line_start..line_end, &format!("{} [REDACTED]", header));
+                        payload_str.replace_range(line_start..line_end, &format!("{} [REDACTED]", header_colon));
                     }
                 }
             }
@@ -261,13 +353,26 @@ pub fn flush_on_alert(pid: u32, alert_id: &str) {
             "records": json_records
         });
 
+        let json_str = serde_json::to_string(&output_data).unwrap_or_default();
+        
+        // Compress using zstd
+        let compressed = match zstd::stream::encode_all(json_str.as_bytes(), 0) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[Warden TLS] Failed to compress forensic payload: {}", e);
+                return;
+            }
+        };
+
+        let output_path = format!("/var/log/kinnector/forensic_{}.json.zst", alert_id_owned);
         let _ = std::fs::create_dir_all("/var/log/kinnector");
         if let Ok(mut file) = std::fs::File::create(&output_path) {
             use std::io::Write;
-            if let Ok(json_str) = serde_json::to_string_pretty(&output_data) {
-                let _ = file.write_all(json_str.as_bytes());
-                println!("[Warden TLS] Forensic flush completed successfully. Saved {} records to {}", collected.len(), output_path);
-            }
+            let _ = file.write_all(&compressed);
+            println!("[Warden TLS] Forensic flush completed successfully. Saved {} compressed records to {}", collected.len(), output_path);
         }
+
+        // Upload forensic payload to backend over cloud TLS/gRPC channel
+        crate::cloud::send_forensic_payload(&alert_id_owned, compressed).await;
     });
 }

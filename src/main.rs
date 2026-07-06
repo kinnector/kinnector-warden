@@ -17,6 +17,7 @@ mod quarantine;
 mod api;
 mod tty_logger;
 mod tls_buffer;
+mod cloud;
 
 #[derive(Parser, Debug)]
 #[command(name = "wardend")]
@@ -154,17 +155,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docker_containers = crate::discovery::discover_docker_containers().await;
     for container in docker_containers {
         println!("[Warden Docker] Monitoring Docker container: {} (Image: {})", container.name, container.image);
+        let mut mounts = Vec::new();
         for wr in container.web_roots {
             let wr_str = wr.to_string_lossy().to_string();
             if !web_roots.contains(&wr_str) {
                 web_roots.push(wr_str);
             }
+            mounts.push(wr);
         }
         for cd in container.config_dirs {
             if !config_dirs.contains(&cd) {
-                config_dirs.push(cd);
+                config_dirs.push(cd.clone());
             }
+            mounts.push(cd);
         }
+        crate::discovery::register_container_mounts(&container.id, mounts);
     }
 
     // P6-4: Start event-driven Docker listener to dynamically watch new containers in real-time
@@ -234,6 +239,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8e. Start Forensic TLS Request Buffer server (Paid Tier)
     crate::tls_buffer::start_tls_telemetry_server();
+
+    // 8f. Start Cloud Services (updates, streaming, remote commands)
+    crate::cloud::start_cloud_services(Arc::clone(&heuristics));
 
 
 

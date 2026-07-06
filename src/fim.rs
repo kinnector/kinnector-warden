@@ -11,12 +11,26 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
 use std::sync::OnceLock;
 
-static FIM_ADD_TX: OnceLock<tokio::sync::mpsc::Sender<PathBuf>> = OnceLock::new();
+pub enum FimCommand {
+    Watch(PathBuf),
+    Unwatch(PathBuf),
+}
+
+static FIM_CMD_TX: OnceLock<tokio::sync::mpsc::Sender<FimCommand>> = OnceLock::new();
 
 /// Request FIM to watch a new path dynamically.
 pub fn add_fim_watch_path(path: PathBuf) -> bool {
-    if let Some(tx) = FIM_ADD_TX.get() {
-        tx.try_send(path).is_ok()
+    if let Some(tx) = FIM_CMD_TX.get() {
+        tx.try_send(FimCommand::Watch(path)).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Request FIM to stop watching a path dynamically.
+pub fn remove_fim_watch_path(path: PathBuf) -> bool {
+    if let Some(tx) = FIM_CMD_TX.get() {
+        tx.try_send(FimCommand::Unwatch(path)).is_ok()
     } else {
         false
     }
@@ -25,8 +39,8 @@ pub fn add_fim_watch_path(path: PathBuf) -> bool {
 pub fn start_fim_watcher(web_root: String, config_dirs: Vec<PathBuf>) {
     tokio::spawn(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let (add_tx, mut add_rx) = tokio::sync::mpsc::channel::<PathBuf>(10);
-        let _ = FIM_ADD_TX.set(add_tx);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<FimCommand>(20);
+        let _ = FIM_CMD_TX.set(cmd_tx);
 
         // Mutex/Cell wrapper not needed since notify RecommendedWatcher has internal mutability
         let mut watcher = match notify::recommended_watcher(move |res| {
@@ -74,10 +88,18 @@ pub fn start_fim_watcher(web_root: String, config_dirs: Vec<PathBuf>) {
                         _ => {}
                     }
                 }
-                Some(new_path) = add_rx.recv() => {
-                    if new_path.exists() {
-                        let _ = watcher.watch(&new_path, RecursiveMode::Recursive);
-                        println!("[Warden FIM] Watching dynamically added path: {}", new_path.display());
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        FimCommand::Watch(new_path) => {
+                            if new_path.exists() {
+                                let _ = watcher.watch(&new_path, RecursiveMode::Recursive);
+                                println!("[Warden FIM] Watching dynamically added path: {}", new_path.display());
+                            }
+                        }
+                        FimCommand::Unwatch(old_path) => {
+                            let _ = watcher.unwatch(&old_path);
+                            println!("[Warden FIM] Unwatching dynamically removed path: {}", old_path.display());
+                        }
                     }
                 }
                 else => break,

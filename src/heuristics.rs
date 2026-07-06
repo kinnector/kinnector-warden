@@ -6,7 +6,7 @@ use std::str::FromStr;
 use crate::types::{
     TelemetryEventRaw, EventType, ProcessCreateDetails, NetworkConnectDetails,
     SSHAuthDetails, TerminalCommandDetails, FileOpenDetails, MemoryMapDetails, Dup2Details,
-    FileWriteDetails, FileRenameDetails,
+    FileWriteDetails, FileRenameDetails, MemoryProtectDetails,
 };
 
 // PROT_EXEC flag for mmap/mprotect detection
@@ -352,6 +352,50 @@ impl HeuristicsEngine {
                                     "Threat.Server.MemoryShellcode",
                                     "Web process created anonymous executable memory mapping — likely in-memory shellcode."
                                 );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // MemoryProtect — S-A anonymous mprotect(PROT_EXEC) shellcode (SIGKILL)
+            // ---------------------------------------------------------------
+            EventType::MemoryProtect => {
+                let details: MemoryProtectDetails = unsafe {
+                    std::ptr::read(raw.details_buffer.as_ptr() as *const MemoryProtectDetails)
+                };
+
+                let new_flags = null_terminated_str(&details.prot_flags);
+                let old_flags = null_terminated_str(&details.old_prot_flags);
+
+                let made_executable = new_flags.contains("PROT_EXEC") && !old_flags.contains("PROT_EXEC");
+
+                if made_executable {
+                    let pid = details.target_pid;
+                    if let Some(proc) = self.process_map.get(&pid) {
+                        if proc.is_web_server {
+                            let is_anon = is_anonymous_mapping(pid, details.address);
+                            if is_anon {
+                                let exe = proc.exe.clone();
+                                let cmd = proc.cmdline.clone();
+                                let ppid = proc.ppid;
+                                let depth = proc.depth;
+                                drop(proc);
+
+                                if depth > 0 {
+                                    self.terminate_threat_child(
+                                        pid, &exe, &cmd, "", ppid,
+                                        "Threat.Server.MemoryShellcode",
+                                        "Web process modified anonymous memory mapping protection to make it executable (mprotect PROT_EXEC) — likely in-memory shellcode. Terminated child process."
+                                    );
+                                } else {
+                                    self.emit_threat(
+                                        pid, &exe, &cmd, "", ppid,
+                                        "Threat.Server.MemoryShellcode",
+                                        "Web process modified anonymous memory mapping protection to make it executable (mprotect PROT_EXEC) — likely in-memory shellcode."
+                                    );
+                                }
                             }
                         }
                     }
@@ -869,7 +913,9 @@ pub fn null_terminated_str(buf: &[u8]) -> String {
 fn log_and_dispatch(payload: crate::notifications::AlertPayload) {
     if let Ok(s) = serde_json::to_string(&payload) {
         let _ = crate::audit::write_to_audit_log(&s);
+        crate::cloud::queue_log_entry(&s);
     }
+    crate::cloud::send_alert_immediate(&payload);
     crate::notifications::dispatch_alert(payload);
 }
 
@@ -910,5 +956,42 @@ fn is_profile_like_path(path: &str) -> bool {
         || path_lower.contains("/etc/profile.d/")
 }
 
+fn is_anonymous_mapping(pid: u32, address: u64) -> bool {
+    let maps_path = format!("/proc/{}/maps", pid);
+    let Ok(content) = std::fs::read_to_string(maps_path) else {
+        return false;
+    };
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 { continue; }
+        let addr_range = parts[0];
+        let inode_str = parts[4];
+        
+        let range_parts: Vec<&str> = addr_range.split('-').collect();
+        if range_parts.len() != 2 { continue; }
+        let start = u64::from_str_radix(range_parts[0], 16).unwrap_or(0);
+        let end = u64::from_str_radix(range_parts[1], 16).unwrap_or(0);
+        
+        if address >= start && address < end {
+            // Found the memory region!
+            // Check if it has inode == 0
+            if let Ok(inode) = inode_str.parse::<u64>() {
+                if inode == 0 {
+                    return true;
+                }
+            }
+            // Check if pathname is empty or anonymous special mapping
+            if parts.len() == 5 {
+                return true;
+            }
+            let pathname = parts[5];
+            if pathname.starts_with('[') || pathname.is_empty() {
+                return true;
+            }
+            return false;
+        }
+    }
+    false
+}
 
 // Q-01: write_to_audit_log moved to crate::audit — this local copy is removed.
