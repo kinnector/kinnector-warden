@@ -19,6 +19,10 @@ enum LockFileType {
     ComposerLock,
     PoetryLock,
     YarnLock,
+    CargoLock,
+    GoSum,
+    GemfileLock,
+    PnpmLock,
 }
 
 struct DetectedDependency {
@@ -116,6 +120,26 @@ pub(crate) async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::E
                     parse_yarn_lock(&content, &mut dependencies, &path_str);
                 }
             }
+            LockFileType::CargoLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_cargo_lock(&content, &mut dependencies, &path_str);
+                }
+            }
+            LockFileType::GoSum => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_go_sum(&content, &mut dependencies, &path_str);
+                }
+            }
+            LockFileType::GemfileLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_gemfile_lock(&content, &mut dependencies, &path_str);
+                }
+            }
+            LockFileType::PnpmLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_pnpm_lock(&content, &mut dependencies, &path_str);
+                }
+            }
         }
     }
 
@@ -127,6 +151,9 @@ pub(crate) async fn run_scan(root_dir: &str) -> Result<(), Box<dyn std::error::E
                 ("npm", "npm") => true,
                 ("pip", "pip") | ("pip", "pypi") => true,
                 ("composer", "composer") | ("composer", "packagist") => true,
+                ("cargo", "cargo") | ("cargo", "crates.io") => true,
+                ("go", "go") | ("go", "golang") => true,
+                ("gem", "gem") | ("gem", "rubygems") => true,
                 _ => false,
             };
 
@@ -202,6 +229,14 @@ fn find_lock_files(dir: &Path, depth: usize) -> Vec<(PathBuf, LockFileType)> {
                         files.push((path, LockFileType::PoetryLock));
                     } else if name == "yarn.lock" {
                         files.push((path, LockFileType::YarnLock));
+                    } else if name == "Cargo.lock" {
+                        files.push((path, LockFileType::CargoLock));
+                    } else if name == "go.sum" {
+                        files.push((path, LockFileType::GoSum));
+                    } else if name == "Gemfile.lock" {
+                        files.push((path, LockFileType::GemfileLock));
+                    } else if name == "pnpm-lock.yaml" {
+                        files.push((path, LockFileType::PnpmLock));
                     }
                 }
             }
@@ -523,6 +558,26 @@ pub fn get_installed_packages(root_dir: &str) -> Vec<InventoryPackage> {
                     parse_yarn_lock(&content, &mut deps, &path_str);
                 }
             }
+            LockFileType::CargoLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_cargo_lock(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::GoSum => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_go_sum(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::GemfileLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_gemfile_lock(&content, &mut deps, &path_str);
+                }
+            }
+            LockFileType::PnpmLock => {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    parse_pnpm_lock(&content, &mut deps, &path_str);
+                }
+            }
         }
         for d in deps {
             dependencies.push(InventoryPackage {
@@ -536,3 +591,97 @@ pub fn get_installed_packages(root_dir: &str) -> Vec<InventoryPackage> {
     }
     dependencies
 }
+
+fn parse_cargo_lock(content: &str, deps: &mut Vec<DetectedDependency>, path: &str) {
+    let mut current_name = None;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("name = ") {
+            current_name = trimmed.strip_prefix("name = ").map(|n| n.trim_matches('"').to_string());
+        } else if trimmed.starts_with("version = ") {
+            if let Some(name) = current_name.take() {
+                let version = trimmed.strip_prefix("version = ").map(|v| v.trim_matches('"').to_string()).unwrap_or_default();
+                deps.push(DetectedDependency {
+                    name,
+                    version,
+                    is_dev: false,
+                    ecosystem_key: "cargo".to_string(),
+                    lock_file_path: path.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn parse_go_sum(content: &str, deps: &mut Vec<DetectedDependency>, path: &str) {
+    let mut added = std::collections::HashSet::new();
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let name = parts[0].to_string();
+            let version = parts[1].trim_start_matches('v').to_string();
+            if !version.ends_with("/go.mod") && added.insert((name.clone(), version.clone())) {
+                deps.push(DetectedDependency {
+                    name,
+                    version,
+                    is_dev: false,
+                    ecosystem_key: "go".to_string(),
+                    lock_file_path: path.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn parse_gemfile_lock(content: &str, deps: &mut Vec<DetectedDependency>, path: &str) {
+    let mut in_specs = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if line.starts_with("  specs:") {
+            in_specs = true;
+            continue;
+        } else if !line.starts_with("    ") && !trimmed.is_empty() {
+            in_specs = false;
+        }
+        if in_specs && line.starts_with("    ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let name = parts[0].to_string();
+                let version = parts[1].trim_matches(|c| c == '(' || c == ')').to_string();
+                deps.push(DetectedDependency {
+                    name,
+                    version,
+                    is_dev: false,
+                    ecosystem_key: "gem".to_string(),
+                    lock_file_path: path.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn parse_pnpm_lock(content: &str, deps: &mut Vec<DetectedDependency>, path: &str) {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('/') && trimmed.ends_with(':') {
+            let pkg_str = trimmed.trim_matches(|c| c == '/' || c == ':');
+            let parts: Vec<&str> = if pkg_str.contains('@') {
+                pkg_str.split('@').collect()
+            } else {
+                pkg_str.split('/').collect()
+            };
+            if parts.len() >= 2 {
+                let name = parts[0].to_string();
+                let version = parts[parts.len() - 1].to_string();
+                deps.push(DetectedDependency {
+                    name,
+                    version,
+                    is_dev: false,
+                    ecosystem_key: "npm".to_string(),
+                    lock_file_path: path.to_string(),
+                });
+            }
+        }
+    }
+}
+

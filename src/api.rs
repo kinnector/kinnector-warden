@@ -273,6 +273,14 @@ async fn handle_http_request(
             let list = crate::discovery::discover_docker_containers().await;
             build_json_response(200, &serde_json::to_value(&list).unwrap_or_else(|_| json!([])))
         }
+        ("GET", "/api/v1/allowlist") => {
+            if let Some(set) = crate::allowlist::get_allowlist() {
+                let inodes: Vec<u64> = set.iter().map(|v| *v).collect();
+                build_json_response(200, &json!({ "allowed_inodes": inodes }))
+            } else {
+                build_json_response(200, &json!({ "allowed_inodes": [] }))
+            }
+        }
         ("GET", "/api/v1/quarantine") => {
             let entries = crate::quarantine::list_quarantined();
             build_json_response(200, &json!({ "quarantined_files": entries }))
