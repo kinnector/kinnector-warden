@@ -1,13 +1,31 @@
-# **kinnector** Warden
+# Kinnector Warden
 
-Warden (`wardend`) is the host and container security daemon for the **kinnector** server-side EDR ecosystem. It manages eBPF telemetry hooks, exposes a local Unix socket and HTTP API for vetting web requests, and executes process and network containment mitigations.
+Kinnector Warden (`wardend`) is the server-side host and container protection engine for the Kinnector security ecosystem. It integrates real-time web request vetting with system-level eBPF behavioral containment.
 
-## Local API Interface
+---
 
-Warden runs a local listener at `/var/run/kinnector/warden.sock` and `127.0.0.1:4080` by default. Application servers and plugins can query this local API to vet incoming parameters or database queries.
+## What it protects
 
-### Vetting Request Payloads
-Vets HTTP parameters and headers for command injection (CMD-i) or SQL injection (SQLi) patterns.
+Web application servers and exposed backend services are primary targets for injection vulnerabilities and remote code execution (RCE). 
+
+Kinnector Warden protects these workloads. It acts as a local security guard, analyzing HTTP request payloads and SQL queries before they run, while simultaneously monitoring the server kernel via eBPF to detect and block post-compromise actions like reverse shells, credential exfiltration, or unauthorized container escapes.
+
+---
+
+## Why WAFs and Antivirus are insufficient
+
+Web Application Firewalls (WAFs) operate at the network layer and are blind to what happens inside the server, failing to detect obfuscated exploits or post-compromise behavior. Antivirus scanners only execute after files are written to disk, failing to detect memory-only attacks or shell duplication.
+
+Kinnector Warden bridges this gap. It combines application-level vetting (SQL and HTTP input checking) with kernel-level enforcement, stopping attacks at the front door and neutralizing them if they bypass initial checks.
+
+---
+
+## Core Capabilities and API
+
+Warden exposes a local Unix domain socket and an HTTP interface (`127.0.0.1:4080`) for application layers and CMS plugins to validate parameters:
+
+### 1. HTTP Input Vetting
+Validates query strings, parameters, and headers for common exploit patterns (such as CMD-i or SQLi) before the application processes them.
 
 * **Endpoint**: `POST /api/v1/vet-payload`
 * **Request**:
@@ -22,10 +40,10 @@ Vets HTTP parameters and headers for command injection (CMD-i) or SQL injection 
     "post_data": "title=Hello&content=SELECT * FROM wp_users; --"
   }
   ```
-* **Response**: Returns either `{"status": "ALLOWED"}` or `{"status": "BLOCKED"}`.
+* **Response**: Returns `{"status": "ALLOWED"}` or `{"status": "BLOCKED"}`.
 
-### Vetting Database Queries
-Vets raw SQL query strings before they are executed against the database.
+### 2. Database Query Vetting
+Vets raw SQL statements before the database driver executes them, blocking injection attempts.
 
 * **Endpoint**: `POST /api/v1/vet-query`
 * **Request**:
@@ -34,24 +52,27 @@ Vets raw SQL query strings before they are executed against the database.
     "query": "SELECT * FROM wp_users WHERE user_login = 'admin' OR '1'='1'"
   }
   ```
-* **Response**: Returns either `{"status": "ALLOWED"}` or `{"status": "BLOCKED"}`.
+* **Response**: Returns `{"status": "ALLOWED"}` or `{"status": "BLOCKED"}`.
 
-## WordPress Integration (wpwarden)
+---
 
-The companion `wpwarden` plugin passes incoming query strings and raw HTTP input buffers to Warden's local socket before they are run. If Warden flags a payload as malicious, the plugin aborts execution and responds with a `403 Forbidden`.
+## Integrations (WordPress Companion)
 
-## Daemon Lifecycle & Installation
+Warden works with the `wpwarden` plugin. The plugin forwards incoming request buffers and SQL queries to Warden's local socket. If Warden flags a payload, the plugin aborts the PHP lifecycle and responds with a `403 Forbidden`.
 
-The WordPress helper plugin attempts to auto-discover Warden on the server. If Warden is not running:
-1. **Automatic Setup**: If the PHP environment has sufficient privileges (e.g., inside a Docker container), it copies the pre-compiled `wardend` binary to `/usr/local/bin/wardend` and configures the systemd service.
-2. **Manual Setup**: If permissions are restricted, the plugin triggers an admin dashboard notice prompting the administrator to run the installer script:
-   ```bash
-   curl -sSL https://raw.githubusercontent.com/kinnector/kinnector-installer/main/install-warden.sh | sudo bash
-   ```
+---
 
-## Compiling from Source
+## Installation and Execution
 
-To build the `wardend` binary:
+### Automated Script Deployment
+Deploy and configure the `wardend` systemd service using the official installer script:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/kinnector/kinnector-installer/main/install-warden.sh | sudo bash
+```
+
+### Compiling from Source
+Build the `wardend` binary locally:
 
 ```bash
 make build
