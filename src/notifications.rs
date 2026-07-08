@@ -1,10 +1,33 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Mutex};
+use std::collections::VecDeque;
 use dashmap::DashMap;
 
 static DISPATCH_DEDUP: OnceLock<Arc<DashMap<String, i64>>> = OnceLock::new();
 const DEDUP_WINDOW_SECS: i64 = 300; // 5 minutes
+
+static RECENT_ALERTS: OnceLock<Mutex<VecDeque<AlertPayload>>> = OnceLock::new();
+const MAX_RECENT_ALERTS: usize = 100;
+
+pub fn add_alert_to_queue(payload: AlertPayload) {
+    let queue = RECENT_ALERTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RECENT_ALERTS)));
+    if let Ok(mut q) = queue.lock() {
+        if q.len() >= MAX_RECENT_ALERTS {
+            q.pop_front();
+        }
+        q.push_back(payload);
+    }
+}
+
+pub fn get_recent_alerts() -> Vec<AlertPayload> {
+    let queue = RECENT_ALERTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RECENT_ALERTS)));
+    if let Ok(q) = queue.lock() {
+        q.iter().cloned().collect()
+    } else {
+        Vec::new()
+    }
+}
 
 /// B-09 fix: Emit a one-time warning if notifications.json is absent so operators
 /// are not silently left wondering why webhooks aren't firing.
@@ -97,6 +120,7 @@ pub async fn load_notification_config() -> Option<NotificationConfig> {
 }
 
 pub fn dispatch_alert(payload: AlertPayload) {
+    add_alert_to_queue(payload.clone());
     if let Ok(s) = serde_json::to_string(&payload) {
         let _ = crate::audit::write_to_audit_log(&s);
         crate::cloud::queue_log_entry(&s);

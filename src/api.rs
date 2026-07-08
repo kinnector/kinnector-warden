@@ -488,6 +488,82 @@ async fn handle_http_request(
                 _ => build_error_response(400, "Missing web_root or exe parameter"),
             }
         }
+        ("GET", "/api/v1/alerts") => {
+            let alerts = crate::notifications::get_recent_alerts();
+            build_json_response(200, &json!({ "alerts": alerts }))
+        }
+        ("POST", "/api/v1/event/alert") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let alert_id = format!("wpn-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+            let threat_type = json_body.get("event_type").and_then(|t| t.as_str()).unwrap_or("Threat.Server.WordPressAnomaly").to_string();
+            let details = json_body.get("details");
+            let details_type = details.and_then(|d| d.get("type")).and_then(|t| t.as_str()).unwrap_or("Unknown");
+            let details_desc = details.and_then(|d| d.get("detail")).and_then(|t| t.as_str()).unwrap_or("WordPress security anomaly detected.");
+            
+            let severity = match details_type {
+                "RCE_Attempt" | "Active_Exploitation_Detected" | "Webshell_Detected" |
+                "PHP_File_In_Uploads" | "Core_File_Integrity_Failure" | "Stealth_Admin_Injected" |
+                "Unauthorized_Admin_Escalation" | "Exploit_Signature_Match" | "Admin_Brute_Force" => "CRITICAL",
+                "Suspicious_Request" | "Core_File_Missing" | "Htaccess_Hardening_Ineffective" |
+                "Vulnerable_Plugins_Detected" => "WARNING",
+                _ => "INFO"
+            }.to_string();
+
+            let payload = crate::notifications::AlertPayload {
+                alert_id,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                threat_type: format!("{}.{}", threat_type, details_type),
+                severity,
+                container: None,
+                process: crate::notifications::ProcessInfo {
+                    pid: 0,
+                    exec_path: "php/wordpress".to_string(),
+                    cmdline: details.and_then(|d| d.get("uri")).and_then(|u| u.as_str()).unwrap_or("").to_string(),
+                    parent_exec_path: "".to_string(),
+                    parent_pid: 0,
+                },
+                remediation: crate::notifications::RemediationInfo {
+                    action: "LOG".to_string(),
+                    status: details_desc.to_string(),
+                },
+            };
+            crate::notifications::dispatch_alert(payload);
+            build_json_response(200, &json!({ "status": "logged" }))
+        }
+        ("POST", "/api/v1/event/user-mgmt") => {
+            let Ok(json_body) = serde_json::from_str::<serde_json::Value>(body) else {
+                return build_error_response(400, "Invalid JSON");
+            };
+            let alert_id = format!("wpn-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+            let action = json_body.get("action").and_then(|a| a.as_str()).unwrap_or("user_action");
+            let details = json_body.get("details");
+            let user_login = details.and_then(|d| d.get("user_login")).and_then(|u| u.as_str()).unwrap_or("unknown");
+            let context = details.and_then(|d| d.get("context")).and_then(|c| c.as_str()).unwrap_or("");
+            let ip = details.and_then(|d| d.get("ip_address")).and_then(|i| i.as_str()).unwrap_or("");
+            
+            let payload = crate::notifications::AlertPayload {
+                alert_id,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                threat_type: format!("Event.Server.WordPressUserMgmt.{}", action),
+                severity: "WARNING".to_string(),
+                container: None,
+                process: crate::notifications::ProcessInfo {
+                    pid: 0,
+                    exec_path: "php/wordpress".to_string(),
+                    cmdline: format!("Context: {}, IP: {}", context, ip),
+                    parent_exec_path: "".to_string(),
+                    parent_pid: 0,
+                },
+                remediation: crate::notifications::RemediationInfo {
+                    action: "AUDIT".to_string(),
+                    status: format!("Admin account added/updated: user='{}' via context '{}'", user_login, context),
+                },
+            };
+            crate::notifications::dispatch_alert(payload);
+            build_json_response(200, &json!({ "status": "logged" }))
+        }
         _ => build_error_response(404, "Not Found"),
     }
 }

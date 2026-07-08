@@ -124,9 +124,12 @@ impl HeuristicsEngine {
                 let child_lower = child_exe.to_lowercase();
                 
                 let install_keywords = [
-                    "npm", "yarn", "pnpm", "pip", "poetry", "pipenv", "composer", 
+                    "npm", "yarn", "pnpm", "bun", "pip", "poetry", "pipenv", "composer", 
                     "cargo", "gem", "bundle", "nuget", "dotnet", "go", 
-                    "apt", "apt-get", "dpkg", "yum", "dnf", "rpm", "pacman", "apk"
+                    "gradle", "gradlew", "mvn", "sbt", "conan", "vcpkg", 
+                    "cpan", "cpanm", "luarocks", "julia", "cabal", "stack", 
+                    "brew", "snap", "apt", "apt-get", "dpkg", "yum", "dnf", 
+                    "rpm", "pacman", "apk"
                 ];
                 let is_child_install = install_keywords.iter().any(|&kw| {
                     child_lower == kw || child_lower.ends_with(&format!("/{}", kw))
