@@ -391,6 +391,18 @@ pub async fn discover_docker_containers() -> Vec<ContainerInfo> {
             }
         }
 
+        let short_id = if id.len() >= 12 { &id[..12] } else { &id };
+        get_active_containers().insert(id.clone(), crate::notifications::ContainerInfo {
+            id: id.clone(),
+            name: name.clone(),
+            image: image.clone(),
+        });
+        get_active_containers().insert(short_id.to_string(), crate::notifications::ContainerInfo {
+            id: id.clone(),
+            name: name.clone(),
+            image: image.clone(),
+        });
+
         containers.push(ContainerInfo {
             id,
             name,
@@ -548,9 +560,14 @@ use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 
 static ACTIVE_CONTAINER_MOUNTS: OnceLock<Arc<DashMap<String, Vec<PathBuf>>>> = OnceLock::new();
+static ACTIVE_CONTAINERS: OnceLock<Arc<DashMap<String, crate::notifications::ContainerInfo>>> = OnceLock::new();
 
 pub fn get_active_container_mounts() -> &'static Arc<DashMap<String, Vec<PathBuf>>> {
     ACTIVE_CONTAINER_MOUNTS.get_or_init(|| Arc::new(DashMap::new()))
+}
+
+pub fn get_active_containers() -> &'static Arc<DashMap<String, crate::notifications::ContainerInfo>> {
+    ACTIVE_CONTAINERS.get_or_init(|| Arc::new(DashMap::new()))
 }
 
 pub fn register_container_mounts(id: &str, mounts: Vec<PathBuf>) {
@@ -558,9 +575,23 @@ pub fn register_container_mounts(id: &str, mounts: Vec<PathBuf>) {
 }
 
 async fn trigger_container_reconfig(id: &str, action: &str) {
+    let is_die_or_stop = action == "die" || action == "stop";
     if action == "start" {
         if let Some(c) = query_single_container(id).await {
             println!("[Warden Docker] Dynamic event: Started container {} (Image: {})", c.name, c.image);
+            
+            let short_id = if id.len() >= 12 { &id[..12] } else { id };
+            get_active_containers().insert(id.to_string(), crate::notifications::ContainerInfo {
+                id: id.to_string(),
+                name: c.name.clone(),
+                image: c.image.clone(),
+            });
+            get_active_containers().insert(short_id.to_string(), crate::notifications::ContainerInfo {
+                id: id.to_string(),
+                name: c.name.clone(),
+                image: c.image.clone(),
+            });
+
             let mut mounts = Vec::new();
             for wr in c.web_roots {
                 println!("[Warden Docker] Dynamically adding FIM watch and allowlist for: {}", wr.display());
@@ -578,8 +609,12 @@ async fn trigger_container_reconfig(id: &str, action: &str) {
             }
             register_container_mounts(id, mounts);
         }
-    } else {
+    } else if is_die_or_stop {
         println!("[Warden Docker] Dynamic event: Stopped container {}", id);
+        let short_id = if id.len() >= 12 { &id[..12] } else { id };
+        get_active_containers().remove(id);
+        get_active_containers().remove(short_id);
+
         if let Some((_, mounts)) = get_active_container_mounts().remove(id) {
             for mount in mounts {
                 println!("[Warden Docker] Dynamically removing FIM watch and allowlist for stopped container mount: {}", mount.display());

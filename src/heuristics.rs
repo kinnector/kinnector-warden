@@ -28,6 +28,7 @@ pub struct ProcessNode {
     pub loaded_scripts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+#[derive(Clone)]
 pub struct HeuristicsEngine {
     pub process_map:   Arc<DashMap<u32, ProcessNode>>,
     pub ssh_attempts:  Arc<DashMap<String, Vec<i64>>>,
@@ -232,7 +233,7 @@ impl HeuristicsEngine {
                         timestamp: Utc::now().to_rfc3339(),
                         threat_type: "Threat.Server.BinaryOrSourcePoisoned".to_string(),
                         severity: "HIGH".to_string(),
-                        container: None,
+                        container: self.resolve_container_info(child_pid),
                         process: crate::notifications::ProcessInfo {
                             pid: child_pid,
                             exec_path: child_exe,
@@ -253,35 +254,47 @@ impl HeuristicsEngine {
             // ProcessStop — evict from map
             // ---------------------------------------------------------------
             EventType::ProcessStop => {
-                let mut pids_to_kill = Vec::new();
+                let mut is_top_level = false;
                 if let Some(proc) = self.process_map.get(&event_pid) {
                     if proc.is_top_level_install {
-                        let root_pid = event_pid;
-                        for entry in self.process_map.iter() {
+                        is_top_level = true;
+                    }
+                }
+
+                if is_top_level {
+                    let root_pid = event_pid;
+                    let engine = self.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                        let mut pids_to_kill = Vec::new();
+                        for entry in engine.process_map.iter() {
                             if entry.value().install_root_pid == root_pid && entry.key() != &root_pid {
                                 pids_to_kill.push(*entry.key());
                             }
                         }
-                    }
+
+                        for child_pid in pids_to_kill {
+                            if let Some(child_proc) = engine.process_map.get(&child_pid) {
+                                let exe = child_proc.exe.clone();
+                                let cmd = child_proc.cmdline.clone();
+                                let ppid = child_proc.ppid;
+                                drop(child_proc);
+
+                                engine.terminate_threat_child(
+                                    child_pid, &exe, &cmd, "", ppid,
+                                    "Vulnerability.SupplyChain.PersistentProcess",
+                                    "Process continued running after package installation completed. Terminated process."
+                                );
+                            }
+                        }
+                        engine.process_map.remove(&root_pid);
+                        engine.process_seen.remove(&root_pid);
+                    });
+                } else {
+                    self.process_map.remove(&event_pid);
+                    self.process_seen.remove(&event_pid);
                 }
-
-                for child_pid in pids_to_kill {
-                    if let Some(child_proc) = self.process_map.get(&child_pid) {
-                        let exe = child_proc.exe.clone();
-                        let cmd = child_proc.cmdline.clone();
-                        let ppid = child_proc.ppid;
-                        drop(child_proc);
-
-                        self.terminate_threat_child(
-                            child_pid, &exe, &cmd, "", ppid,
-                            "Vulnerability.SupplyChain.PersistentProcess",
-                            "Process continued running after package installation completed. Terminated process."
-                        );
-                    }
-                }
-
-                self.process_map.remove(&event_pid);
-                self.process_seen.remove(&event_pid);
             }
 
             // ---------------------------------------------------------------
@@ -426,6 +439,15 @@ impl HeuristicsEngine {
 
                     if is_install {
                         let path_lower = path.to_lowercase();
+                        if path_lower.contains("/var/run/docker.sock") || path_lower.contains("/run/containerd/containerd.sock") {
+                            self.terminate_threat_child(
+                                event_pid, &exe, &cmd, "", ppid,
+                                "Vulnerability.SupplyChain.DockerSocketAccess",
+                                &format!("Package install process attempted to access container runtime socket: {}", path)
+                            );
+                            return;
+                        }
+
                         let is_cred = path_lower.contains("/.ssh/")
                             || path_lower.contains("/id_rsa")
                             || path_lower.contains("/id_dsa")
@@ -438,6 +460,16 @@ impl HeuristicsEngine {
                             || path_lower.contains("/.git-credentials")
                             || path_lower.contains("/.pypirc")
                             || path_lower.contains("/.pip/")
+                            || path_lower.contains("/.kube/")
+                            || path_lower.contains("/var/run/secrets/kubernetes.io/")
+                            || path_lower.contains("/etc/kubernetes/")
+                            || path_lower.contains("/.config/gcloud/")
+                            || path_lower.contains("/.gnupg/")
+                            || path_lower.contains("/.cargo/credentials")
+                            || path_lower.contains("/.cargo/credentials.toml")
+                            || path_lower.contains("/.config/gh/")
+                            || path_lower.contains("/.gem/credentials")
+                            || path_lower.contains("/.vault-token")
                             || path_lower == "/etc/shadow";
 
                         if is_cred {
@@ -548,15 +580,23 @@ impl HeuristicsEngine {
 
                 if is_reverse_shell {
                     if let Some(proc) = self.process_map.get(&event_pid) {
-                        if proc.is_web_server {
+                        if proc.is_web_server || proc.is_install_context {
                             let exe = proc.exe.clone();
                             let cmd = proc.cmdline.clone();
                             let ppid = proc.ppid;
+                            let is_web = proc.is_web_server;
                             drop(proc);
+                            
+                            let (threat_type, msg) = if is_web {
+                                ("Threat.Server.ReverseShell", "Web process duplicated socket fd to stdin/stdout — classic reverse shell pattern. Terminated process tree.")
+                            } else {
+                                ("Vulnerability.SupplyChain.ReverseShell", "Package install process duplicated socket fd to stdin/stdout — classic reverse shell pattern. Terminated process tree.")
+                            };
+
                             self.terminate_threat_child(
                                 event_pid, &exe, &cmd, "", ppid,
-                                "Threat.Server.ReverseShell",
-                                "Web process duplicated socket fd to stdin/stdout — classic reverse shell pattern. Terminated process tree."
+                                threat_type,
+                                msg
                             );
                         }
                     }
@@ -697,8 +737,18 @@ impl HeuristicsEngine {
                     );
                 }
 
+                if is_install && (path.contains("/var/run/docker.sock") || path.contains("/run/containerd/containerd.sock")) {
+                    self.terminate_threat_child(
+                        event_pid, &exe, &cmd, "", ppid,
+                        "Vulnerability.SupplyChain.DockerSocketAccess",
+                        &format!("Package install process attempted to write to container runtime socket: {}", path),
+                    );
+                    return;
+                }
+
                 // --- S-I: Persistence path / profile monitoring ---
-                if is_web || is_install || is_profile || self.config.is_persistence_path(&path) {
+                let is_persistence = is_profile || self.config.is_persistence_path(&path);
+                if is_persistence {
                     if is_install {
                         self.terminate_threat_child(
                             event_pid, &exe, &cmd, "", ppid,
@@ -847,7 +897,7 @@ impl HeuristicsEngine {
                             timestamp: Utc::now().to_rfc3339(),
                             threat_type: "Threat.Server.BinaryOrSourcePoisoned".to_string(),
                             severity: "HIGH".to_string(),
-                            container: None,
+                            container: self.resolve_container_info(event_pid),
                             process: crate::notifications::ProcessInfo {
                                 pid: event_pid,
                                 exec_path: exe,
@@ -965,7 +1015,7 @@ impl HeuristicsEngine {
                             timestamp: Utc::now().to_rfc3339(),
                             threat_type: "Threat.Server.ShellSpawnAttempt".to_string(),
                             severity: "CRITICAL".to_string(),
-                            container: None,
+                            container: self.resolve_container_info(event_pid),
                             process: crate::notifications::ProcessInfo {
                                 pid: event_pid,
                                 exec_path: tty.clone(),
@@ -1090,7 +1140,7 @@ impl HeuristicsEngine {
             timestamp: Utc::now().to_rfc3339(),
             threat_type: threat_type.to_string(),
             severity: "CRITICAL".to_string(),
-            container: None,
+            container: self.resolve_container_info(pid),
             process: crate::notifications::ProcessInfo {
                 pid,
                 exec_path: exe.to_string(),
@@ -1132,7 +1182,7 @@ impl HeuristicsEngine {
             timestamp: Utc::now().to_rfc3339(),
             threat_type: threat_type.to_string(),
             severity: "CRITICAL".to_string(),
-            container: None,
+            container: self.resolve_container_info(child_pid),
             process: crate::notifications::ProcessInfo {
                 pid: child_pid,
                 exec_path: child_exe.to_string(),
@@ -1168,7 +1218,7 @@ impl HeuristicsEngine {
             timestamp: Utc::now().to_rfc3339(),
             threat_type: threat_type.to_string(),
             severity: severity.to_string(),
-            container: None,
+            container: self.resolve_container_info(pid),
             process: crate::notifications::ProcessInfo {
                 pid,
                 exec_path: exe.to_string(),
@@ -1201,6 +1251,42 @@ impl HeuristicsEngine {
             }
         }
     }
+
+    fn resolve_container_info(&self, pid: u32) -> Option<crate::notifications::ContainerInfo> {
+        let cid = get_container_id(pid)?;
+        if let Some(cinfo) = crate::discovery::get_active_containers().get(&cid) {
+            Some(cinfo.value().clone())
+        } else {
+            Some(crate::notifications::ContainerInfo {
+                id: cid.clone(),
+                name: format!("container-{}", &cid[..std::cmp::min(12, cid.len())]),
+                image: "unknown".to_string(),
+            })
+        }
+    }
+}
+
+fn get_container_id(pid: u32) -> Option<String> {
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    if let Ok(content) = std::fs::read_to_string(cgroup_path) {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 {
+                let path = parts[2];
+                if let Some(pos) = path.rfind('/') {
+                    let last_part = &path[pos + 1..];
+                    let clean_id = last_part
+                        .trim_start_matches("cri-containerd-")
+                        .trim_start_matches("docker-")
+                        .trim_end_matches(".scope");
+                    if clean_id.len() == 64 && clean_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                        return Some(clean_id[..12].to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
